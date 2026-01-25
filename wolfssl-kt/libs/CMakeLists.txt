@@ -156,3 +156,7 @@ target_link_libraries(
         android
         log
 )
+
+# Align segments for 16 KB page size devices (Android 15+ requirement).
+target_link_options(wolfssl PRIVATE -Wl,-z,max-page-size=16384)
+target_link_options(wolfssljni PRIVATE -Wl,-z,max-page-size=16384)
