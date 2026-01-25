@@ -1,0 +1,436 @@
+<?xml version="1.0"?>
+<project name="wolfssl" default="build" basedir="." xmlns:jacoco="antlib:org.jacoco.ant">
+
+    <description>
+    wolfSSL JNI is a Java wrapper for the wolfSSL lightweight SSL/TLS library.
+
+    This build file requires JUnit for running provided JUnit tests. JUnit can
+    be downloaded from: http:/www.junit.org/
+
+    When running JUnit tests, this package will look for JUnit at:
+    $JUNIT_HOME/junit.jar
+    </description>
+
+    <!-- versioning/manifest properties -->
+    <property name="implementation.vendor"  value="wolfSSL Inc." />
+    <property name="implementation.title"   value="wolfSSL JNI/JSSE" />
+    <property name="implementation.version" value="1.16" />
+
+    <!-- set properties for this build -->
+    <property name="src.dir" value="src/java/"/>
+    <property name="native.dir" value="native"/>
+    <property name="lib.dir" value="lib/"/>
+    <property name="build.dir" value="build"/>
+    <property name="doc.dir" value="docs"/>
+    <property name="test.dir" value="src/test/"/>
+    <property name="test.build.dir" value="build/test"/>
+    <property name="examples.dir" value="examples/"/>
+    <property name="examples.build.dir" value="examples/build"/>
+    <property name="reports.dir" value="build/reports"/>
+
+    <!-- These paths should be relative to JUNIT_HOME -->
+    <property name="junit4" value="junit-4.13.2.jar" />
+    <property name="hamcrest-core" value="hamcrest-all-1.3.jar" />
+    <property name="ant-junit4" value="ant/ant-junit4.jar" />
+
+    <property environment="env"/>
+
+    <!-- check for SNIHostName class to determine if JDK version >= 1.8 -->
+    <available property="have-SNIHostName" classname="javax.net.ssl.SNIHostName" />
+
+    <!-- Detect if running on Windows host -->
+    <condition property="isWindows">
+        <os family="windows" />
+    </condition>
+
+    <!-- check if javac nativeheaderdir is available -->
+    <condition property="have-nativeheaderdir">
+        <and>
+            <antversion atleast="1.9.8"/>
+            <not>
+                <or>
+                    <equals arg1="${ant.java.version}" arg2="1.5"/>
+                    <equals arg1="${ant.java.version}" arg2="1.6"/>
+                    <equals arg1="${ant.java.version}" arg2="1.7"/>
+                </or>
+            </not>
+        </and>
+    </condition>
+
+    <taskdef uri="antlib:org.jacoco.ant" resource="org/jacoco/ant/antlib.xml">
+        <classpath path="${env.JACOCO_HOME}/jacocoant.jar"/>
+    </taskdef>
+
+    <!-- classpath to compiled wolfssl.jar, for running tests -->
+    <path id="classpath">
+        <fileset dir="${lib.dir}" includes="*.jar">
+            <include name="wolfssl.jar"/>
+        </fileset>
+        <fileset dir="${env.JUNIT_HOME}" erroronmissingdir="false">
+            <include name="${junit4}"/>
+        </fileset>
+    </path>
+
+    <target name="init" depends="clean, default-javac-flags">
+        <mkdir dir="${build.dir}"/>
+        <mkdir dir="${lib.dir}"/>
+        <mkdir dir="${examples.build.dir}"/>
+        <mkdir dir="${test.build.dir}"/>
+        <mkdir dir="${reports.dir}"/>
+    </target>
+
+    <target name="clean">
+        <delete dir="${test.build.dir}"/>
+        <delete dir="${build.dir}"/>
+        <delete dir="${examples.build.dir}"/>
+        <delete dir="${reports.dir}"/>
+        <delete failonerror="false">
+            <fileset dir="${lib.dir}" includes="wolfssl.jar" />
+            <fileset dir="${lib.dir}" includes="wolfssl-jsse.jar" />
+        </delete>
+    </target>
+
+    <target name="cleanjni">
+        <delete>
+            <fileset dir="${lib.dir}" includes="*.dylib"/>
+            <fileset dir="${lib.dir}" includes="*.so"/>
+            <fileset dir="${native.dir}" includes="*.o"/>
+        </delete>
+    </target>
+
+    <target name="build" depends="init, compile-nativeheaderdir, compile-javah, jar, jar-jsse, javah, javadoc"/>
+    <target name="build-jacoco" depends="init, compile-nativeheaderdir, compile-javah, jar, jar-jsse, javah, javadoc, examples, test-jacoco, coverage-report"/>
+
+    <target name="compile-nativeheaderdir" if="have-nativeheaderdir">
+        <javac destdir="${build.dir}"
+               nativeheaderdir="${native.dir}"
+               debug="${java.debug}"
+               debuglevel="${java.debuglevel}"
+               deprecation="${java.deprecation}"
+               optimize="${java.optimize}"
+               source="${java.source}"
+               target="${java.target}"
+               classpathref="classpath"
+               includeantruntime="false">
+            <compilerarg value="-Xlint:-options"/>
+            <src path="${src.dir}" />
+            <include name="com/wolfssl/**" />
+            <include name="com/wolfssl/provider/jsse/**" />
+            <include name="com/wolfssl/provider/jsse/adapter/**" />
+            <exclude name="com/wolfssl/provider/jsse/adapter/WolfSSLJDK8Helper.java" unless="have-SNIHostName" />
+        </javac>
+        <!-- Copy resources to build directory for ServiceLoader -->
+        <copy todir="${build.dir}" failonerror="false">
+            <fileset dir="src/resources" includes="**/*" />
+        </copy>
+    </target>
+
+    <target name="compile-javah" unless="have-nativeheaderdir">
+        <javac destdir="${build.dir}"
+               debug="${java.debug}"
+               debuglevel="${java.debuglevel}"
+               deprecation="${java.deprecation}"
+               optimize="${java.optimize}"
+               source="${java.source}"
+               target="${java.target}"
+               classpathref="classpath"
+               includeantruntime="false">
+            <compilerarg value="-Xlint:-options"/>
+            <src path="${src.dir}" />
+            <include name="com/wolfssl/**" />
+            <include name="com/wolfssl/provider/jsse/**" />
+            <include name="com/wolfssl/provider/jsse/adapter/**" />
+            <exclude name="com/wolfssl/provider/jsse/adapter/WolfSSLJDK8Helper.java" unless="have-SNIHostName" />
+        </javac>
+        <!-- Copy resources to build directory for ServiceLoader -->
+        <copy todir="${build.dir}" failonerror="false">
+            <fileset dir="src/resources" includes="**/*" />
+        </copy>
+    </target>
+
+    <target name="javah" unless="have-nativeheaderdir">
+        <javah destdir="${native.dir}" force="yes" classpathref="classpath">
+            <class name="com.wolfssl.WolfSSL"/>
+            <class name="com.wolfssl.WolfSSLCertManager"/>
+            <class name="com.wolfssl.WolfSSLCertificate"/>
+            <class name="com.wolfssl.WolfSSLContext"/>
+            <class name="com.wolfssl.WolfSSLSession"/>
+            <class name="com.wolfssl.WolfSSLX509StoreCtx"/>
+            <class name="com.wolfssl.WolfCryptECC"/>
+            <class name="com.wolfssl.WolfCryptEccKey"/>
+            <class name="com.wolfssl.WolfCryptRSA"/>
+        </javah>
+    </target>
+
+    <target name="default-javac-flags"
+            description="Set the javac flags that will produce a debug jar
+            with no compiler optimisation and all debug symbols" >
+        <property name="java.debug" value="true"/>
+        <property name="java.debuglevel" value="source,lines,vars"/>
+        <property name="java.deprecation" value="true"/>
+        <property name="java.optimize" value="false"/>
+        <property name="java.source" value="1.8"/>
+        <property name="java.target" value="1.8"/>
+    </target>
+
+    <target name="jar">
+        <jar jarfile="${lib.dir}/wolfssl.jar">
+            <manifest>
+                <attribute name="Implementation-Title"
+                           value="${implementation.title}" />
+                <attribute name="Implementation-Version"
+                           value="${implementation.version}" />
+                <attribute name="Implementation-Vendor"
+                           value="${implementation.vendor}" />
+            </manifest>
+            <fileset dir="${build.dir}">
+                <include name="com/wolfssl/*.class"/>
+            </fileset>
+        </jar>
+    </target>
+
+    <target name="jar-jsse">
+        <jar jarfile="${lib.dir}/wolfssl-jsse.jar" basedir="${build.dir}">
+            <manifest>
+                <attribute name="Implementation-Title"
+                           value="${implementation.title}" />
+                <attribute name="Implementation-Version"
+                           value="${implementation.version}" />
+                <attribute name="Implementation-Vendor"
+                           value="${implementation.vendor}" />
+            </manifest>
+        </jar>
+    </target>
+
+    <target name="javadoc" description="generate documentation">
+        <javadoc destdir="${doc.dir}">
+            <fileset dir="${src.dir}">
+                <include name="com/wolfssl/**"/>
+                <include name="com/wolfssl/provider/jsse/**"/>
+                <exclude name="com/wolfssl/provider/jsse/adapter/WolfSSLJDK8Helper.java" unless="have-SNIHostName" />
+            </fileset>
+        </javadoc>
+    </target>
+
+    <target name="examples" depends="build">
+        <javac srcdir="${examples.dir}"
+               destdir="${examples.build.dir}"
+               debug="${java.debug}"
+               debuglevel="${java.debuglevel}"
+               deprecation="${java.deprecation}"
+               optimize="${java.optimize}"
+               source="${java.source}"
+               target="${java.target}"
+               classpathref="classpath"
+               includeantruntime="false">
+            <compilerarg value="-Xlint:-options"/>
+        </javac>
+    </target>
+
+    <target name="build-test" depends="build">
+        <javac srcdir="${test.dir}"
+               destdir="${test.build.dir}"
+               debug="${java.debug}"
+               debuglevel="${java.debuglevel}"
+               deprecation="${java.depreciation}"
+               optimize="${java.optimize}"
+               source="${java.source}"
+               target="${java.target}"
+               classpathref="classpath"
+               includeantruntime="false">
+            <compilerarg value="-Xlint:-options"/>
+        </javac>
+    </target>
+
+    <!-- Set property to indicate Windows platform (Win32, x86) -->
+    <target name="setup-win32-debug">
+        <property name="ant.test.platform" value="Win32"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Debug/Win32/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/DLL Debug/Win32"/>
+    </target>
+    <target name="setup-win32-release">
+        <property name="ant.test.platform" value="Win32"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Release/Win32/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/DLL Release/Win32"/>
+    </target>
+
+    <target name="setup-win64-debug">
+        <property name="ant.test.platform" value="x64"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Debug/x64/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/DLL Debug/x64"/>
+    </target>
+    <target name="setup-win64-release">
+        <property name="ant.test.platform" value="x64"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Release/x64/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/DLL Release/x64"/>
+    </target>
+
+    <target name="setup-win32-debug-fips">
+        <property name="ant.test.platform" value="Win32"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Debug FIPS/Win32/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/IDE/WIN10/DLL Debug/Win32"/>
+    </target>
+    <target name="setup-win32-release-fips">
+        <property name="ant.test.platform" value="Win32"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Release FIPS/Win32/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/IDE/WIN10/DLL Release/Win32"/>
+    </target>
+    <target name="setup-win64-debug-fips">
+        <property name="ant.test.platform" value="x64"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Debug FIPS/x64/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/IDE/WIN10/DLL Debug/x64"/>
+    </target>
+    <target name="setup-win64-release-fips">
+        <property name="ant.test.platform" value="x64"/>
+        <property name="lib.win.dir" value="IDE/WIN/DLL Release FIPS/x64/"/>
+        <property name="lib.wolfssl.win.dir" value="../wolfssl/IDE/WIN10/DLL Release/x64"/>
+    </target>
+
+    <!-- Windows ant test targets, should be used in place of 'ant test' -->
+    <!-- Windows 32-bit -->
+    <target name="test-win32-debug" depends="setup-win32-debug, test"
+            description="Run JUnit tests on Windows x86/32-bit DLL Debug">
+    </target>
+    <target name="test-win32-release" depends="setup-win32-release, test"
+            description="Run JUnit tests on Windows x86/32-bit DLL Release">
+    </target>
+
+    <!-- Windows x64 -->
+    <target name="test-win64-debug" depends="setup-win64-debug, test"
+            description="Run JUnit tests on Windows x64/64-bit DLL Debug">
+    </target>
+    <target name="test-win64-release" depends="setup-win64-release, test"
+            description="Run JUnit tests on Windows x64/64-bit DLL Release">
+    </target>
+
+    <!-- Windows FIPS 140-2/140-3 -->
+    <target name="test-win32-debug-fips" depends="setup-win32-debug-fips, test"
+            description="Run JUnit tests on Windows x86/32-bit DLL FIPS Debug">
+    </target>
+    <target name="test-win32-release-fips" depends="setup-win32-release-fips, test"
+            description="Run JUnit tests on Windows x86/32-bit DLL FIPS Release">
+    </target>
+    <target name="test-win64-debug-fips" depends="setup-win64-debug-fips, test"
+            description="Run JUnit tests on Windows x64/64-bit DLL FIPS Debug">
+    </target>
+    <target name="test-win64-release-fips" depends="setup-win64-release-fips, test"
+            description="Run JUnit tests on Windows x64/64-bit DLL FIPS Release">
+    </target>
+
+    <!-- Print usage if plain 'ant test' called on Windows -->
+    <target name="antTestWindowsCheck">
+      <condition property="antTestCalledIncorrect">
+        <and>
+          <equals arg1="${isWindows}" arg2="true"/>
+          <equals arg1="${ant.project.invoked-targets}" arg2="test"/>
+        </and>
+      </condition>
+
+      <fail message="Please see usage instructions below" if="antTestCalledIncorrect">
+        wolfSSL JNI and JSSE: JUnit Test Usage on Windows
+        ---------------------------------------------------------------------------->
+        Run one of the following ant test targets for Windows use:
+        Normal wolfSSL (non-FIPS):
+            ant test-win32-debug         |  Run JUnit tests for Windows 32-bit Debug build
+            ant test-win32-release       |  Run JUnit tests for Windows 32-bit Release build
+            ant test-win64-debug         |  Run JUnit tests for Windows 64-bit Debug build
+            ant test-win64-release       |  Run JUnit tests for Windows 64-bit Release build
+
+        wolfSSL FIPS 140-2 / 140-3:
+            ant test-win32-debug-fips    |  Run JUnit tests for Windows 32-bit Debug FIPS build
+            ant test-win32-release-fips  |  Run JUnit tests for Windows 32-bit Release FIPS build
+            ant test-win64-debug-fips    |  Run JUnit tests for Windows 64-bit Debug FIPS build
+            ant test-win64-release-fips  |  Run JUnit tests for Windows 64-bit Release FIPS build
+        ----------------------------------------------------------------------------
+      </fail>
+    </target>
+
+    <!-- Primary ant test target, called direct on Linux/OSX
+         or from test-win32/test-win64 on Windows -->
+    <target name="test" description="Compile and run JUnit tests" depends="antTestWindowsCheck, build-test">
+        <property environment="env"/>
+        <junit printsummary="yes" showoutput="yes" haltonfailure="yes" fork="true">
+            <sysproperty key="sun.boot.library.path" value="$JAVA_HOME/bin:${lib.dir}" />
+            <env key="LD_LIBRARY_PATH" path="${env.LD_LIBRARY_PATH}:{lib.dir}:/usr/local/lib" />
+            <env key="CLASSPATH" path="${env.LD_LIBRARY_PATH}:${env.JUNIT_HOME}/${junit4}" />
+            <jvmarg value="-Djava.library.path=$JAVA_HOME/bin${path.separator}${env.LD_LIBRARY_PATH}${path.separator}${env.DYLD_LIBRARY_PATH}${path.separator}${lib.dir}${path.separator}${lib.win.dir}${path.separator}${lib.wolfssl.win.dir}"/>
+
+            <classpath>
+                <pathelement location="${build.dir}"/>
+                <pathelement location="${test.build.dir}"/>
+                <fileset dir="${env.JUNIT_HOME}">
+                    <include name="${junit4}"/>
+                    <include name="${hamcrest-core}"/>
+                    <include name="${ant-junit4}"/>
+                </fileset>
+            </classpath>
+
+            <formatter type="plain"/>
+            <formatter type="xml"/>
+
+            <batchtest fork="yes" todir="${reports.dir}">
+                <fileset dir="${test.dir}">
+                    <include name="**/*TestSuite.java"/>
+                </fileset>
+            </batchtest>
+        </junit>
+    </target>
+
+    <target name="test-jacoco" depends="build-test">
+        <jacoco:coverage destfile="${build.dir}/jacoco.exec">
+        <junit printsummary="yes" showoutput="yes" haltonfailure="yes" fork="true">
+        <classpath>
+            <pathelement location="${build.dir}"/>
+            <pathelement location="${test.build.dir}"/>
+            <fileset dir="${env.JUNIT_HOME}">
+                <include name="${junit4}"/>
+                <include name="${hamcrest-core}"/>
+                <include name="${ant-junit4}"/>
+            </fileset>
+        </classpath>
+
+        <formatter type="plain"/>
+        <formatter type="xml"/>
+
+        <sysproperty key="sun.boot.library.path" value="$JAVA_HOME/bin:${lib.dir}" />
+        <env key="LD_LIBRARY_PATH" path="${env.LD_LIBRARY_PATH}:{lib.dir}:/usr/local/lib" />
+        <env key="CLASSPATH" path="${env.LD_LIBRARY_PATH}:${env.JUNIT_HOME}/${junit4}" />
+
+        <batchtest fork="yes" todir="${reports.dir}">
+            <fileset dir="${test.dir}">
+                <include name="**/*TestSuite.java"/>
+            </fileset>
+        </batchtest>
+
+        </junit>
+        </jacoco:coverage>
+    </target>
+
+    <target name="coverage-report">
+        <jacoco:report>
+            <executiondata>
+                <file file="${build.dir}/jacoco.exec"/>
+            </executiondata>
+
+            <structure name="wolfSSL JNI/JSSE">
+                <classfiles>
+                    <fileset dir="${build.dir}">
+                        <include name="com/wolfssl/*.class"/>
+                        <include name="com/wolfssl/provider/jsse/*.class"/>
+                    </fileset>
+                </classfiles>
+                <sourcefiles>
+                    <fileset dir="${src.dir}">
+                        <include name="com/wolfssl/*.java"/>
+                        <include name="com/wolfssl/provider/jsse/*.java"/>
+                    </fileset>
+                </sourcefiles>
+            </structure>
+            <html destdir="report"/>
+            <csv destfile="report/report.csv"/>
+        </jacoco:report>
+    </target>
+
+    <target name="coverage" depends="build-jacoco"/>
+
+</project>
