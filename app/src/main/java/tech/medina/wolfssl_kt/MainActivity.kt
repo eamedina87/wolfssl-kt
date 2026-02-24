@@ -17,14 +17,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import tech.medina.wolfssl_kt.ui.dashboard.DashboardScreen
-import tech.medina.wolfssl_kt.ui.home.HomeScreen
-import tech.medina.wolfssl_kt.ui.notifications.NotificationsScreen
+import tech.medina.wolfssl_kt.ui.client.ClientScreen
+import tech.medina.wolfssl_kt.ui.client.ClientViewModel
+import tech.medina.wolfssl_kt.ui.server.ServerScreen
 
 class MainActivity : ComponentActivity() {
 
@@ -43,14 +44,14 @@ private enum class BottomNavDestination(
     @StringRes val labelRes: Int,
     @DrawableRes val iconRes: Int
 ) {
-    HOME("home", R.string.title_home, R.drawable.ic_home_black_24dp),
-    DASHBOARD("dashboard", R.string.title_dashboard, R.drawable.ic_dashboard_black_24dp),
-    NOTIFICATIONS("notifications", R.string.title_notifications, R.drawable.ic_notifications_black_24dp)
+    CLIENT("client", R.string.title_client, R.drawable.ic_home_black_24dp),
+    SERVER("server", R.string.title_server, R.drawable.ic_dashboard_black_24dp)
 }
 
 @Composable
 private fun WolfSslApp() {
     val navController = rememberNavController()
+    val viewModel: ClientViewModel = viewModel()
     val items = BottomNavDestination.entries
     Scaffold(
         bottomBar = {
@@ -86,17 +87,14 @@ private fun WolfSslApp() {
     ) { innerPadding ->
         NavHost(
             navController = navController,
-            startDestination = BottomNavDestination.HOME.route,
+            startDestination = BottomNavDestination.CLIENT.route,
             modifier = Modifier.padding(innerPadding)
         ) {
-            composable(BottomNavDestination.HOME.route) {
-                HomeScreen()
+            composable(BottomNavDestination.CLIENT.route) {
+                ClientScreen(viewModel = viewModel)
             }
-            composable(BottomNavDestination.DASHBOARD.route) {
-                DashboardScreen()
-            }
-            composable(BottomNavDestination.NOTIFICATIONS.route) {
-                NotificationsScreen()
+            composable(BottomNavDestination.SERVER.route) {
+                ServerScreen(viewModel = viewModel)
             }
         }
     }

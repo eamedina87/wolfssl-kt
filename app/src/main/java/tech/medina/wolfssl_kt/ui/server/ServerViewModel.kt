@@ -1,10 +1,10 @@
-package tech.medina.wolfssl_kt.ui.dashboard
+package tech.medina.wolfssl_kt.ui.server
 
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 
-class DashboardViewModel : ViewModel() {
+class ServerViewModel : ViewModel() {
 
     private val _text = MutableLiveData<String>().apply {
         value = "This is dashboard Fragment"
