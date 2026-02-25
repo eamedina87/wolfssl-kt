@@ -18,12 +18,17 @@ import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 data class DiscoveredBleDevice(
     val name: String?,
@@ -31,21 +36,23 @@ data class DiscoveredBleDevice(
     val rssi: Int
 )
 
-sealed class BleConnectionEvent {
-    data object ScanStarted : BleConnectionEvent()
-    data object ScanStopped : BleConnectionEvent()
-    data class DeviceDiscovered(val device: DiscoveredBleDevice) : BleConnectionEvent()
-    data class Connected(val address: String) : BleConnectionEvent()
-    data class Disconnected(val address: String) : BleConnectionEvent()
-    data class ServicesReady(val address: String) : BleConnectionEvent()
-    data class CharacteristicWriteFailed(val status: Int) : BleConnectionEvent()
-    data class Error(val message: String) : BleConnectionEvent()
+sealed class BleClientConnectionEvent {
+    data object ScanStarted : BleClientConnectionEvent()
+    data object ScanStopped : BleClientConnectionEvent()
+    data class DeviceDiscovered(val device: DiscoveredBleDevice) : BleClientConnectionEvent()
+    data class Connected(val address: String) : BleClientConnectionEvent()
+    data class Disconnected(val address: String) : BleClientConnectionEvent()
+    data class ServicesReady(val address: String) : BleClientConnectionEvent()
+    data class CharacteristicWriteFailed(val status: Int) : BleClientConnectionEvent()
+    data class Error(val message: String) : BleClientConnectionEvent()
 }
 
-class BluetoothLeConnectionManager(
+class BluetoothLeClientConnectionManager(
     context: Context,
-    private val bluetoothProvider: GattBluetoothProvider
+    private val bluetoothProvider: BluetoothProvider,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) {
+    private val appContext = context.applicationContext
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
     private val scanner: BluetoothLeScanner?
@@ -56,17 +63,19 @@ class BluetoothLeConnectionManager(
     private val _discoveredDevices = MutableStateFlow<List<DiscoveredBleDevice>>(emptyList())
     val discoveredDevices: StateFlow<List<DiscoveredBleDevice>> = _discoveredDevices.asStateFlow()
 
-    private val _events = MutableSharedFlow<BleConnectionEvent>(extraBufferCapacity = 64)
-    val events: SharedFlow<BleConnectionEvent> = _events.asSharedFlow()
+    private val _events = MutableSharedFlow<BleClientConnectionEvent>(extraBufferCapacity = 64)
+    val events: SharedFlow<BleClientConnectionEvent> = _events.asSharedFlow()
 
     private var currentGatt: BluetoothGatt? = null
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
+    private var outgoingWriteJob: Job? = null
 
     @SuppressLint("MissingPermission")
     fun startScan() {
         val bleScanner = scanner
         if (bleScanner == null) {
-            emitEvent(BleConnectionEvent.Error("BLE scanner not available"))
+            emitEvent(BleClientConnectionEvent.Error("BLE scanner not available"))
             return
         }
 
@@ -81,26 +90,34 @@ class BluetoothLeConnectionManager(
         scanResults.clear()
         _discoveredDevices.value = emptyList()
         bleScanner.startScan(listOf(filter), settings, scanCallback)
-        emitEvent(BleConnectionEvent.ScanStarted)
+        emitEvent(BleClientConnectionEvent.ScanStarted)
     }
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
         scanner?.stopScan(scanCallback)
-        emitEvent(BleConnectionEvent.ScanStopped)
+        emitEvent(BleClientConnectionEvent.ScanStopped)
     }
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
-        currentGatt?.close()
-        bluetoothProvider.unbind()
-        notifyCharacteristic = null
+        closeCurrentConnection()
         currentGatt = device.connectGatt(
-            null,
+            appContext,
             false,
             gattCallback,
             BluetoothDevice.TRANSPORT_LE
         )
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connect(address: String) {
+        val device = bluetoothAdapter?.getRemoteDevice(address)
+        if (device == null) {
+            emitEvent(BleClientConnectionEvent.Error("Device not found for address $address"))
+            return
+        }
+        connect(device)
     }
 
     @SuppressLint("MissingPermission")
@@ -109,33 +126,65 @@ class BluetoothLeConnectionManager(
     }
 
     fun close() {
-        currentGatt?.close()
-        currentGatt = null
-        notifyCharacteristic = null
-        bluetoothProvider.unbind()
+        closeCurrentConnection()
+    }
+
+    private fun startOutgoingWriter() {
+        outgoingWriteJob?.cancel()
+        outgoingWriteJob = scope.launch {
+            for (data in bluetoothProvider.outgoingChannel) {
+                writeToServerCharacteristic(data)
+            }
+        }
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(address: String) {
-        val device = bluetoothAdapter?.getRemoteDevice(address)
-        if (device == null) {
-            emitEvent(BleConnectionEvent.Error("Device not found for address $address"))
+    private fun writeToServerCharacteristic(data: ByteArray) {
+        val gatt = currentGatt ?: return
+        val characteristic = writeCharacteristic ?: return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val status = gatt.writeCharacteristic(
+                characteristic,
+                data,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            )
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
+            }
             return
         }
-        connect(device)
+
+        @Suppress("DEPRECATION")
+        run {
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            characteristic.value = data
+            val started = gatt.writeCharacteristic(characteristic)
+            if (!started) {
+                emitEvent(BleClientConnectionEvent.Error("Failed to start characteristic write"))
+            }
+        }
+    }
+
+    private fun closeCurrentConnection() {
+        outgoingWriteJob?.cancel()
+        outgoingWriteJob = null
+        writeCharacteristic = null
+        notifyCharacteristic = null
+        currentGatt?.close()
+        currentGatt = null
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val address = result.device.address ?: return
             val discovered = DiscoveredBleDevice(
                 name = result.device.name ?: result.scanRecord?.deviceName,
-                address = address,
+                address = result.device.address,
                 rssi = result.rssi
             )
-            scanResults[address] = discovered
+            scanResults[discovered.address] = discovered
             _discoveredDevices.value = scanResults.values.toList()
-            emitEvent(BleConnectionEvent.DeviceDiscovered(discovered))
+            emitEvent(BleClientConnectionEvent.DeviceDiscovered(discovered))
         }
 
         override fun onBatchScanResults(results: List<ScanResult>) {
@@ -143,7 +192,7 @@ class BluetoothLeConnectionManager(
         }
 
         override fun onScanFailed(errorCode: Int) {
-            emitEvent(BleConnectionEvent.Error("Scan failed with code=$errorCode"))
+            emitEvent(BleClientConnectionEvent.Error("Scan failed with code=$errorCode"))
         }
     }
 
@@ -151,22 +200,19 @@ class BluetoothLeConnectionManager(
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleConnectionEvent.Error("Connection state error status=$status"))
+                emitEvent(BleClientConnectionEvent.Error("Connection state error status=$status"))
                 gatt.close()
-                bluetoothProvider.unbind()
                 return
             }
 
             when (newState) {
                 BluetoothGatt.STATE_CONNECTED -> {
-                    emitEvent(BleConnectionEvent.Connected(gatt.device.address))
+                    emitEvent(BleClientConnectionEvent.Connected(gatt.device.address))
                     gatt.discoverServices()
                 }
                 BluetoothGatt.STATE_DISCONNECTED -> {
-                    emitEvent(BleConnectionEvent.Disconnected(gatt.device.address))
-                    bluetoothProvider.unbind()
-                    notifyCharacteristic = null
-                    gatt.close()
+                    emitEvent(BleClientConnectionEvent.Disconnected(gatt.device.address))
+                    closeCurrentConnection()
                 }
             }
         }
@@ -174,36 +220,36 @@ class BluetoothLeConnectionManager(
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleConnectionEvent.Error("Service discovery failed status=$status"))
+                emitEvent(BleClientConnectionEvent.Error("Service discovery failed status=$status"))
                 return
             }
 
             val service: BluetoothGattService = gatt.getService(BluetoothGattProfile.SERVICE_UUID)
                 ?: run {
-                    emitEvent(BleConnectionEvent.Error("Required BLE service not found"))
+                    emitEvent(BleClientConnectionEvent.Error("Required BLE service not found"))
                     return
                 }
 
-            val writeCharacteristic = service.getCharacteristic(BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID)
+            writeCharacteristic = service.getCharacteristic(BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID)
                 ?: run {
-                    emitEvent(BleConnectionEvent.Error("Write characteristic not found"))
+                    emitEvent(BleClientConnectionEvent.Error("Write characteristic not found"))
                     return
                 }
 
             notifyCharacteristic = service.getCharacteristic(BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID)
                 ?: run {
-                    emitEvent(BleConnectionEvent.Error("Notify characteristic not found"))
+                    emitEvent(BleClientConnectionEvent.Error("Notify characteristic not found"))
                     return
                 }
 
-            bluetoothProvider.bind(gatt, writeCharacteristic)
             enableNotifications(gatt, notifyCharacteristic!!)
-            emitEvent(BleConnectionEvent.ServicesReady(gatt.device.address))
+            startOutgoingWriter()
+            emitEvent(BleClientConnectionEvent.ServicesReady(gatt.device.address))
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
-                bluetoothProvider.onCharacteristicReceived(value)
+                bluetoothProvider.publishIncoming(value)
             }
         }
 
@@ -214,13 +260,7 @@ class BluetoothLeConnectionManager(
             }
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 val value = characteristic.value ?: return
-                bluetoothProvider.onCharacteristicReceived(value)
-            }
-        }
-
-        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleConnectionEvent.CharacteristicWriteFailed(status))
+                bluetoothProvider.publishIncoming(value)
             }
         }
     }
@@ -229,20 +269,20 @@ class BluetoothLeConnectionManager(
     private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
         val notifySet = gatt.setCharacteristicNotification(characteristic, true)
         if (!notifySet) {
-            emitEvent(BleConnectionEvent.Error("Failed to enable local notifications"))
+            emitEvent(BleClientConnectionEvent.Error("Failed to enable local notifications"))
             return
         }
 
         val descriptor = characteristic.getDescriptor(BluetoothGattProfile.CCC_DESCRIPTOR_UUID)
         if (descriptor == null) {
-            emitEvent(BleConnectionEvent.Error("CCC descriptor not found"))
+            emitEvent(BleClientConnectionEvent.Error("CCC descriptor not found"))
             return
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val status = gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleConnectionEvent.Error("Failed to write CCC descriptor, status=$status"))
+                emitEvent(BleClientConnectionEvent.Error("Failed to write CCC descriptor, status=$status"))
             }
             return
         }
@@ -252,17 +292,17 @@ class BluetoothLeConnectionManager(
             descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             val started = gatt.writeDescriptor(descriptor)
             if (!started) {
-                emitEvent(BleConnectionEvent.Error("Failed to start CCC descriptor write"))
+                emitEvent(BleClientConnectionEvent.Error("Failed to start CCC descriptor write"))
             }
         }
     }
 
-    private fun emitEvent(event: BleConnectionEvent) {
+    private fun emitEvent(event: BleClientConnectionEvent) {
         _events.tryEmit(event)
         Log.d(TAG, event.toString())
     }
 
     private companion object {
-        const val TAG = "BleConnectionManager"
+        const val TAG = "BleClientConnectionManager"
     }
 }
