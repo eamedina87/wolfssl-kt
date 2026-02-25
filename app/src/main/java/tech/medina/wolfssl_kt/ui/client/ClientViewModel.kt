@@ -90,7 +90,8 @@ class ClientViewModel(
             pemPrivateKey = byteArrayOf(),
             caCertificate = byteArrayOf(),
             certificateChain = byteArrayOf(),
-            encryptedDataChannel = bluetoothProvider.channel
+            incomingEncryptedDataChannel = bluetoothProvider.incomingChannel,
+            outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel
         )
     }
 

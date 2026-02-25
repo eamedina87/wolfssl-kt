@@ -75,7 +75,15 @@ object WolfSslKt {
         }
     }
 
-    fun prepareTls13Connection(cipher: SupportedCipher, mode: TlsMode, pemPrivateKey: ByteArray, caCertificate: ByteArray, certificateChain: ByteArray, encryptedDataChannel: Channel<ByteArray>) : Result<Unit> {
+    fun prepareTls13Connection(
+        cipher: SupportedCipher,
+        mode: TlsMode,
+        pemPrivateKey: ByteArray,
+        caCertificate: ByteArray,
+        certificateChain: ByteArray,
+        incomingEncryptedDataChannel: Channel<ByteArray>,
+        outgoingEncryptedDataChannel: Channel<ByteArray>
+    ) : Result<Unit> {
         return try {
             if (currentSession != null) {
                 throw IllegalStateException("There's a session already created. Stop or release current session before creating a new one.")
@@ -92,7 +100,7 @@ object WolfSslKt {
                 loadVerifyBuffer(caCertificate, caCertificate.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
                 val internalChannel = Channel<Byte>(capacity = UNLIMITED)
                 receiveJob = appScope.launch {
-                    encryptedDataChannel.receiveAsFlow()
+                    incomingEncryptedDataChannel.receiveAsFlow()
                         .buffer(UNLIMITED)
                         .collect { chunk ->
                             chunk.forEach {
@@ -118,7 +126,7 @@ object WolfSslKt {
                 setIOSend { session: WolfSSLSession, buffer: ByteArray, size: Int, context: Any ->
                     //here we receive the encrypted data to be sent to the peer
                     runBlocking {
-                        encryptedDataChannel.send(buffer.copyOf(size))
+                        outgoingEncryptedDataChannel.send(buffer.copyOf(size))
                         size
                     }
                 }
