@@ -2,7 +2,6 @@ package tech.medina.wolfssl_kt.ui.client
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -12,9 +11,10 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import tech.medina.wolfssl.kt.WolfSslKt
 import tech.medina.wolfssl_kt.bluetooth.BluetoothProvider
+import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 
 class ClientViewModel(
-    private val bluetoothProvider: BluetoothProvider = DefaultBluetoothProvider
+    private val bluetoothProvider: BluetoothProvider = GattBluetoothProvider()
 ) : ViewModel() {
 
     private val _connectionState = MutableStateFlow("Idle")
@@ -123,8 +123,4 @@ class ClientViewModel(
             _serverConnectionStatus.value = "Waiting for clients"
         }
     }
-}
-
-private object DefaultBluetoothProvider : BluetoothProvider {
-    override val channel = Channel<ByteArray>(Channel.UNLIMITED)
 }
