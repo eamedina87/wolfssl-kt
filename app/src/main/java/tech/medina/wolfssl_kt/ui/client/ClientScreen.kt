@@ -16,10 +16,14 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -30,6 +34,9 @@ fun ClientScreen(viewModel: ClientViewModel) {
     val selectedServer by viewModel.selectedServer.collectAsState()
     val clientConnectionStatus by viewModel.clientConnectionStatus.collectAsState()
     val transportState by viewModel.connectionState.collectAsState()
+    val latestOutputValue by viewModel.clientOutputCharacteristicValue.collectAsState()
+    val writeStatus by viewModel.clientWriteStatus.collectAsState()
+    var inputText by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -111,6 +118,26 @@ fun ClientScreen(viewModel: ClientViewModel) {
         )
         Text(
             text = "Connection state: $transportState",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        OutlinedTextField(
+            value = inputText,
+            onValueChange = { inputText = it },
+            label = { Text("Input characteristic value (client -> server)") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Button(
+            onClick = { viewModel.sendClientInputCharacteristic(inputText) },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(text = "Write Input Characteristic")
+        }
+        Text(
+            text = "Input write state: $writeStatus",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Text(
+            text = "Latest output characteristic: $latestOutputValue",
             style = MaterialTheme.typography.bodyMedium
         )
     }

@@ -43,6 +43,8 @@ sealed class BleClientConnectionEvent {
     data class Connected(val address: String) : BleClientConnectionEvent()
     data class Disconnected(val address: String) : BleClientConnectionEvent()
     data class ServicesReady(val address: String) : BleClientConnectionEvent()
+    data class OutputCharacteristicValueReceived(val value: ByteArray) : BleClientConnectionEvent()
+    data object InputCharacteristicWriteSuccess : BleClientConnectionEvent()
     data class CharacteristicWriteFailed(val status: Int) : BleClientConnectionEvent()
     data class Error(val message: String) : BleClientConnectionEvent()
 }
@@ -127,6 +129,10 @@ class BluetoothLeClientConnectionManager(
 
     fun close() {
         closeCurrentConnection()
+    }
+
+    fun writeInputCharacteristic(data: ByteArray) {
+        writeToServerCharacteristic(data)
     }
 
     private fun startOutgoingWriter() {
@@ -250,6 +256,7 @@ class BluetoothLeClientConnectionManager(
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
+                emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
             }
         }
 
@@ -261,6 +268,22 @@ class BluetoothLeClientConnectionManager(
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 val value = characteristic.value ?: return
                 bluetoothProvider.publishIncoming(value)
+                emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid != BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID) {
+                return
+            }
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                emitEvent(BleClientConnectionEvent.InputCharacteristicWriteSuccess)
+            } else {
+                emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
             }
         }
     }

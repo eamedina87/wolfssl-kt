@@ -35,6 +35,9 @@ sealed class BleServerConnectionEvent {
     data object AdvertisingStopped : BleServerConnectionEvent()
     data class DeviceConnected(val address: String) : BleServerConnectionEvent()
     data class DeviceDisconnected(val address: String) : BleServerConnectionEvent()
+    data class InputCharacteristicValueReceived(val value: ByteArray) : BleServerConnectionEvent()
+    data class OutputCharacteristicWriteSuccess(val address: String) : BleServerConnectionEvent()
+    data class OutputCharacteristicWriteFailed(val address: String, val status: Int) : BleServerConnectionEvent()
     data class Error(val message: String) : BleServerConnectionEvent()
 }
 
@@ -129,6 +132,10 @@ class BluetoothLeServerConnectionManager(
         emitEvent(BleServerConnectionEvent.AdvertisingStopped)
     }
 
+    fun writeOutputCharacteristic(data: ByteArray) {
+        notifyConnectedDevices(data)
+    }
+
     private fun buildService(): BluetoothGattService {
         val service = BluetoothGattService(
             BluetoothGattProfile.SERVICE_UUID,
@@ -171,7 +178,10 @@ class BluetoothLeServerConnectionManager(
     private fun notifyConnectedDevices(data: ByteArray) {
         val server = gattServer ?: return
         val characteristic = notifyCharacteristic ?: return
-        if (connectedDevices.isEmpty()) return
+        if (connectedDevices.isEmpty()) {
+            emitEvent(BleServerConnectionEvent.Error("No connected client for output characteristic write"))
+            return
+        }
 
         connectedDevices.toList().forEach { device ->
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -234,6 +244,7 @@ class BluetoothLeServerConnectionManager(
         ) {
             if (characteristic.uuid == BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
+                emitEvent(BleServerConnectionEvent.InputCharacteristicValueReceived(value.copyOf()))
             }
 
             if (responseNeeded) {
@@ -253,6 +264,14 @@ class BluetoothLeServerConnectionManager(
         ) {
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+            }
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                emitEvent(BleServerConnectionEvent.OutputCharacteristicWriteSuccess(device.address))
+            } else {
+                emitEvent(BleServerConnectionEvent.OutputCharacteristicWriteFailed(device.address, status))
             }
         }
     }

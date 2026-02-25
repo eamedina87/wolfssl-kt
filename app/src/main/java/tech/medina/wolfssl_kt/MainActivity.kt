@@ -26,6 +26,7 @@ import androidx.navigation.compose.rememberNavController
 import tech.medina.wolfssl_kt.ui.client.ClientScreen
 import tech.medina.wolfssl_kt.ui.client.ClientViewModel
 import tech.medina.wolfssl_kt.ui.server.ServerScreen
+import tech.medina.wolfssl_kt.ui.server.ServerViewModel
 
 class MainActivity : ComponentActivity() {
 
@@ -51,7 +52,8 @@ private enum class BottomNavDestination(
 @Composable
 private fun WolfSslApp() {
     val navController = rememberNavController()
-    val viewModel: ClientViewModel = viewModel()
+    val clientViewModel: ClientViewModel = viewModel()
+    val serverViewModel: ServerViewModel = viewModel()
     val items = BottomNavDestination.entries
     Scaffold(
         bottomBar = {
@@ -91,10 +93,10 @@ private fun WolfSslApp() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(BottomNavDestination.CLIENT.route) {
-                ClientScreen(viewModel = viewModel)
+                ClientScreen(viewModel = clientViewModel)
             }
             composable(BottomNavDestination.SERVER.route) {
-                ServerScreen(viewModel = viewModel)
+                ServerScreen(viewModel = serverViewModel)
             }
         }
     }
