@@ -1,5 +1,6 @@
 package tech.medina.wolfssl_kt.bluetooth
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -14,10 +15,12 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.bluetooth.le.ScanCallback.SCAN_FAILED_ALREADY_STARTED
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,18 +75,24 @@ class BluetoothLeClientConnectionManager(
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var outgoingWriteJob: Job? = null
+    private var isScanning = false
 
-    @SuppressLint("MissingPermission")
+    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN])
     fun startScan() {
+        if (isScanning) {
+            emitEvent(BleClientConnectionEvent.Error("Scan already running"))
+            return
+        }
+
         val bleScanner = scanner
         if (bleScanner == null) {
             emitEvent(BleClientConnectionEvent.Error("BLE scanner not available"))
             return
         }
 
-        val filter = ScanFilter.Builder()
+        /*val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
-            .build()
+            .build()*/
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -91,13 +100,18 @@ class BluetoothLeClientConnectionManager(
 
         scanResults.clear()
         _discoveredDevices.value = emptyList()
-        bleScanner.startScan(listOf(filter), settings, scanCallback)
+        bleScanner.startScan(listOf(), settings, scanCallback)
+        isScanning = true
         emitEvent(BleClientConnectionEvent.ScanStarted)
     }
 
-    @SuppressLint("MissingPermission")
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun stopScan() {
+        if (!isScanning) {
+            return
+        }
         scanner?.stopScan(scanCallback)
+        isScanning = false
         emitEvent(BleClientConnectionEvent.ScanStopped)
     }
 
@@ -127,6 +141,7 @@ class BluetoothLeClientConnectionManager(
         currentGatt?.disconnect()
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     fun close() {
         closeCurrentConnection()
     }
@@ -172,6 +187,7 @@ class BluetoothLeClientConnectionManager(
         }
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     private fun closeCurrentConnection() {
         outgoingWriteJob?.cancel()
         outgoingWriteJob = null
@@ -182,9 +198,24 @@ class BluetoothLeClientConnectionManager(
     }
 
     private val scanCallback = object : ScanCallback() {
+
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val scanRecord = result.scanRecord ?: return
+            if (ENABLE_SCAN_DIAGNOSTICS) {
+                logScanResult(callbackType, result)
+            }
+            val manufacturerData = scanRecord.getManufacturerSpecificData(BluetoothGattProfile.DISCOVERY_MANUFACTURER_ID)
+            val hasSignature = manufacturerData?.contentEquals(BluetoothGattProfile.DISCOVERY_MANUFACTURER_DATA) == true
+            if (!hasSignature) {
+                if (ENABLE_SCAN_DIAGNOSTICS) {
+                    Log.d(TAG, "Scan reject: missing signature for ${result.device.address}")
+                }
+                return
+            }
+
             val discovered = DiscoveredBleDevice(
-                name = result.device.name ?: result.scanRecord?.deviceName,
+                name = result.device.name ?: scanRecord.deviceName,
                 address = result.device.address,
                 rssi = result.rssi
             )
@@ -198,7 +229,13 @@ class BluetoothLeClientConnectionManager(
         }
 
         override fun onScanFailed(errorCode: Int) {
-            emitEvent(BleClientConnectionEvent.Error("Scan failed with code=$errorCode"))
+            isScanning = errorCode == SCAN_FAILED_ALREADY_STARTED
+            val message = if (errorCode == SCAN_FAILED_ALREADY_STARTED) {
+                "Scan already started"
+            } else {
+                "Scan failed with code=$errorCode"
+            }
+            emitEvent(BleClientConnectionEvent.Error(message))
         }
     }
 
@@ -325,7 +362,46 @@ class BluetoothLeClientConnectionManager(
         Log.d(TAG, event.toString())
     }
 
+    @SuppressLint("MissingPermission")
+    private fun logScanResult(callbackType: Int, result: ScanResult) {
+        val record = result.scanRecord
+        val uuids = record?.serviceUuids?.joinToString(prefix = "[", postfix = "]") { it.toString() } ?: "[]"
+        val serviceData = record?.getServiceData(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
+        val manufacturerEntries = buildString {
+            if (record == null) {
+                append("[]")
+                return@buildString
+            }
+            val data = record.manufacturerSpecificData
+            if (data == null || data.size() == 0) {
+                append("[]")
+                return@buildString
+            }
+            append("[")
+            for (i in 0 until data.size()) {
+                if (i > 0) append(", ")
+                val id = data.keyAt(i)
+                append(id)
+                append("=")
+                append(data.valueAt(i)?.toHexString() ?: "null")
+            }
+            append("]")
+        }
+        Log.d(
+            TAG,
+            "Scan raw: cb=$callbackType addr=${result.device.address} name=${result.device.name ?: record?.deviceName} " +
+                "rssi=${result.rssi} uuids=$uuids serviceData=${serviceData.toHexString()} manufacturer=$manufacturerEntries"
+        )
+    }
+
+    private fun ByteArray?.toHexString(): String {
+        if (this == null) return "null"
+        if (isEmpty()) return ""
+        return joinToString(separator = " ") { "%02X".format(it) }
+    }
+
     private companion object {
         const val TAG = "BleClientConnectionManager"
+        const val ENABLE_SCAN_DIAGNOSTICS = true
     }
 }

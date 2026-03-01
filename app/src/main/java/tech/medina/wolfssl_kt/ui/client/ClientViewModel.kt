@@ -1,6 +1,8 @@
 package tech.medina.wolfssl_kt.ui.client
 
+import android.Manifest
 import android.app.Application
+import androidx.annotation.RequiresPermission
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +29,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private val _selectedServer = MutableStateFlow<String?>(null)
     val selectedServer: StateFlow<String?> = _selectedServer.asStateFlow()
 
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+
     private val _clientConnectionStatus = MutableStateFlow("Disconnected")
     val clientConnectionStatus: StateFlow<String> = _clientConnectionStatus.asStateFlow()
 
@@ -41,10 +46,20 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         observeClientEvents()
     }
 
+    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
     fun scanForServers() {
+        if (_isScanning.value) {
+            _clientConnectionStatus.value = "Scan already running"
+            return
+        }
         _clientConnectionStatus.value = "Scanning..."
         _connectionState.value = "Client scanning"
         clientManager.startScan()
+    }
+
+    fun onScanPermissionDenied() {
+        _clientConnectionStatus.value = "Bluetooth scan permission is required"
+        _connectionState.value = "Client permission denied"
     }
 
     fun selectServer(serverName: String) {
@@ -52,13 +67,26 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         _clientConnectionStatus.value = "Selected $serverName"
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun connectToSelectedServer() {
         val selected = _selectedServer.value ?: return
         val address = serverAddressByLabel[selected] ?: selected
         _clientConnectionStatus.value = "Connecting to $selected"
         _connectionState.value = "Client connecting"
+        _isScanning.value = false
         clientManager.stopScan()
         clientManager.connect(address)
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
+    fun stopScanning() {
+        if (!_isScanning.value) {
+            return
+        }
+        _isScanning.value = false
+        _clientConnectionStatus.value = "Stopping scan..."
+        _connectionState.value = "Client scan stopped"
+        clientManager.stopScan()
     }
 
     fun sendClientInputCharacteristic(text: String) {
@@ -72,10 +100,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     fun disconnect() {
         clientManager.disconnect()
+        _isScanning.value = false
         _clientConnectionStatus.value = "Disconnected"
         _connectionState.value = "Client disconnected"
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun onCleared() {
         super.onCleared()
         clientManager.close()
@@ -104,9 +134,11 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
             clientManager.events.collect { event ->
                 when (event) {
                     BleClientConnectionEvent.ScanStarted -> {
+                        _isScanning.value = true
                         _clientConnectionStatus.value = "Scan started"
                     }
                     BleClientConnectionEvent.ScanStopped -> {
+                        _isScanning.value = false
                         _clientConnectionStatus.value = "Scan stopped"
                     }
                     is BleClientConnectionEvent.DeviceDiscovered -> {
@@ -134,6 +166,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         _clientWriteStatus.value = "Input characteristic write failed (status=${event.status})"
                     }
                     is BleClientConnectionEvent.Error -> {
+                        if (event.message.contains("Scan already", ignoreCase = true)) {
+                            _isScanning.value = true
+                        }
                         _clientConnectionStatus.value = event.message
                         _clientWriteStatus.value = event.message
                     }

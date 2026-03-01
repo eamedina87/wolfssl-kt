@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import tech.medina.wolfssl_kt.bluetooth.BleServerConnectionEvent
+import tech.medina.wolfssl_kt.bluetooth.BluetoothGattProfile
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeServerConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 
@@ -19,7 +20,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     private val _connectionState = MutableStateFlow("Idle")
     val connectionState: StateFlow<String> = _connectionState.asStateFlow()
 
-    private val _deviceName = MutableStateFlow("WolfSSL Device")
+    private val _deviceName = MutableStateFlow("1000")
     val deviceName: StateFlow<String> = _deviceName.asStateFlow()
 
     private val _isAdvertising = MutableStateFlow(false)
@@ -39,15 +40,21 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateDeviceName(newName: String) {
-        _deviceName.value = newName
+        _deviceName.value = stripAdvertisingPrefix(newName)
+    }
+
+    fun onAdvertisingPermissionDenied() {
+        _serverConnectionStatus.value = "Bluetooth advertise permission is required"
+        _connectionState.value = "Server permission denied"
     }
 
     fun startAdvertising() {
+        val friendlyName = ensureAdvertisingPrefix(_deviceName.value)
         _isAdvertising.value = true
-        _serverConnectionStatus.value = "Starting BLE server as ${_deviceName.value}"
+        _serverConnectionStatus.value = "Starting BLE server as $friendlyName"
         _connectionState.value = "Server starting"
         serverManager.startServer()
-        serverManager.startAdvertising(_deviceName.value)
+        serverManager.startAdvertising(friendlyName)
     }
 
     fun stopAdvertising() {
@@ -117,5 +124,16 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         val text = value.decodeToString()
         val hex = value.joinToString(" ") { b -> "%02X".format(b) }
         return "$text (hex: $hex)"
+    }
+
+    private fun ensureAdvertisingPrefix(name: String): String {
+        val trimmed = stripAdvertisingPrefix(name).ifBlank { "1000" }
+        return "${BluetoothGattProfile.ADVERTISING_NAME_PREFIX}_$trimmed".trim()
+    }
+
+    private fun stripAdvertisingPrefix(name: String): String {
+        val trimmed = name.trim()
+        val pattern = Regex("^${Regex.escape(BluetoothGattProfile.ADVERTISING_NAME_PREFIX)}\\s*", RegexOption.IGNORE_CASE)
+        return trimmed.replaceFirst(pattern, "").trim()
     }
 }

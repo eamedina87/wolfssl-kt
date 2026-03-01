@@ -1,5 +1,11 @@
 package tech.medina.wolfssl_kt.ui.client
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,18 +31,47 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 
 @Composable
 fun ClientScreen(viewModel: ClientViewModel) {
+    val context = LocalContext.current
     val availableServers by viewModel.availableServers.collectAsState()
     val selectedServer by viewModel.selectedServer.collectAsState()
+    val isScanning by viewModel.isScanning.collectAsState()
     val clientConnectionStatus by viewModel.clientConnectionStatus.collectAsState()
     val transportState by viewModel.connectionState.collectAsState()
     val latestOutputValue by viewModel.clientOutputCharacteristicValue.collectAsState()
     val writeStatus by viewModel.clientWriteStatus.collectAsState()
     var inputText by remember { mutableStateOf("") }
+    val scanPermissions = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+    val scanPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = scanPermissions.all { permission ->
+            permissions[permission] == true || ContextCompat.checkSelfPermission(
+                context,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        if (allGranted) {
+            viewModel.scanForServers()
+        } else {
+            viewModel.onScanPermissionDenied()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -51,10 +86,24 @@ fun ClientScreen(viewModel: ClientViewModel) {
             fontWeight = FontWeight.SemiBold
         )
         Button(
-            onClick = viewModel::scanForServers,
+            onClick = {
+                if (hasPermissions(context, scanPermissions)) {
+                    viewModel.scanForServers()
+                } else {
+                    scanPermissionLauncher.launch(scanPermissions)
+                }
+            },
+            enabled = !isScanning,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(text = "Scan for servers")
+            Text(text = if (isScanning) "Scanning..." else "Scan for servers")
+        }
+        OutlinedButton(
+            onClick = viewModel::stopScanning,
+            enabled = isScanning,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(text = "Stop scanning")
         }
         Text(
             text = "Available servers",
@@ -140,5 +189,11 @@ fun ClientScreen(viewModel: ClientViewModel) {
             text = "Latest output characteristic: $latestOutputValue",
             style = MaterialTheme.typography.bodyMedium
         )
+    }
+}
+
+private fun hasPermissions(context: Context, permissions: Array<String>): Boolean {
+    return permissions.all { permission ->
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 }

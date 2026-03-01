@@ -1,5 +1,11 @@
 package tech.medina.wolfssl_kt.ui.server
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,11 +23,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 
 @Composable
 fun ServerScreen(viewModel: ServerViewModel) {
+    val context = LocalContext.current
     val deviceName by viewModel.deviceName.collectAsState()
     val isAdvertising by viewModel.isAdvertising.collectAsState()
     val serverConnectionStatus by viewModel.serverConnectionStatus.collectAsState()
@@ -29,6 +38,31 @@ fun ServerScreen(viewModel: ServerViewModel) {
     val latestInputValue by viewModel.serverInputCharacteristicValue.collectAsState()
     val writeStatus by viewModel.serverWriteStatus.collectAsState()
     var outputText by remember { mutableStateOf("") }
+    val advertisePermissions = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
+        } else {
+            emptyArray()
+        }
+    }
+    val advertisePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = advertisePermissions.all { permission ->
+            permissions[permission] == true || ContextCompat.checkSelfPermission(
+                context,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        if (allGranted) {
+            viewModel.startAdvertising()
+        } else {
+            viewModel.onAdvertisingPermissionDenied()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -48,7 +82,13 @@ fun ServerScreen(viewModel: ServerViewModel) {
             modifier = Modifier.fillMaxWidth()
         )
         Button(
-            onClick = viewModel::startAdvertising,
+            onClick = {
+                if (hasPermissions(context, advertisePermissions)) {
+                    viewModel.startAdvertising()
+                } else {
+                    advertisePermissionLauncher.launch(advertisePermissions)
+                }
+            },
             enabled = !isAdvertising,
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -93,5 +133,11 @@ fun ServerScreen(viewModel: ServerViewModel) {
             text = "Connection state: $transportState",
             style = MaterialTheme.typography.bodyMedium
         )
+    }
+}
+
+private fun hasPermissions(context: Context, permissions: Array<String>): Boolean {
+    return permissions.all { permission ->
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 }

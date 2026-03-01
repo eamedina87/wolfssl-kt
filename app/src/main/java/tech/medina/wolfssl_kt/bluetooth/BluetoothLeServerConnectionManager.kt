@@ -112,15 +112,19 @@ class BluetoothLeServerConnectionManager(
         deviceName?.let { bluetoothAdapter?.name = it }
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
             .setTimeout(0)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .addServiceUuid(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
+            .setIncludeDeviceName(false)
+            //.addServiceUuid(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
+            .addManufacturerData(
+                BluetoothGattProfile.DISCOVERY_MANUFACTURER_ID,
+                BluetoothGattProfile.DISCOVERY_MANUFACTURER_DATA
+            )
             .build()
 
         bleAdvertiser.startAdvertising(settings, data, advertiseCallback)
