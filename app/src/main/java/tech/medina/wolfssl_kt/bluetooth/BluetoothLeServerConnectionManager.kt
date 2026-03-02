@@ -59,6 +59,7 @@ class BluetoothLeServerConnectionManager(
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private val connectedDevices = LinkedHashSet<BluetoothDevice>()
     private var outgoingNotifyJob: Job? = null
+    private var isAdvertising = false
 
     @SuppressLint("MissingPermission")
     fun startServer() {
@@ -102,14 +103,12 @@ class BluetoothLeServerConnectionManager(
     }
 
     @SuppressLint("MissingPermission")
-    fun startAdvertising(deviceName: String? = null) {
+    fun startAdvertising() {
         val bleAdvertiser = advertiser
         if (bleAdvertiser == null) {
             emitEvent(BleServerConnectionEvent.Error("BLE advertiser not available"))
             return
         }
-
-        deviceName?.let { bluetoothAdapter?.name = it }
 
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -120,7 +119,6 @@ class BluetoothLeServerConnectionManager(
 
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
-            //.addServiceUuid(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
             .addManufacturerData(
                 BluetoothGattProfile.DISCOVERY_MANUFACTURER_ID,
                 BluetoothGattProfile.DISCOVERY_MANUFACTURER_DATA
@@ -132,12 +130,24 @@ class BluetoothLeServerConnectionManager(
 
     @SuppressLint("MissingPermission")
     fun stopAdvertising() {
+        if (!isAdvertising) {
+            return
+        }
         advertiser?.stopAdvertising(advertiseCallback)
+        isAdvertising = false
         emitEvent(BleServerConnectionEvent.AdvertisingStopped)
     }
 
     fun writeOutputCharacteristic(data: ByteArray) {
         notifyConnectedDevices(data)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnectConnectedClients() {
+        val server = gattServer ?: return
+        connectedDevices.toList().forEach { device ->
+            server.cancelConnection(device)
+        }
     }
 
     private fun buildService(): BluetoothGattService {
@@ -208,10 +218,12 @@ class BluetoothLeServerConnectionManager(
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            isAdvertising = true
             emitEvent(BleServerConnectionEvent.AdvertisingStarted)
         }
 
         override fun onStartFailure(errorCode: Int) {
+            isAdvertising = false
             emitEvent(BleServerConnectionEvent.Error("Advertising failed with code=$errorCode"))
         }
     }
@@ -226,6 +238,9 @@ class BluetoothLeServerConnectionManager(
 
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    if (isAdvertising) {
+                        stopAdvertising()
+                    }
                     connectedDevices += device
                     emitEvent(BleServerConnectionEvent.DeviceConnected(device.address))
                 }

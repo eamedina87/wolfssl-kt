@@ -31,8 +31,8 @@ import androidx.core.content.ContextCompat
 @Composable
 fun ServerScreen(viewModel: ServerViewModel) {
     val context = LocalContext.current
-    val deviceName by viewModel.deviceName.collectAsState()
     val isAdvertising by viewModel.isAdvertising.collectAsState()
+    val hasActiveConnection by viewModel.hasActiveConnection.collectAsState()
     val serverConnectionStatus by viewModel.serverConnectionStatus.collectAsState()
     val transportState by viewModel.connectionState.collectAsState()
     val latestInputValue by viewModel.serverInputCharacteristicValue.collectAsState()
@@ -75,12 +75,6 @@ fun ServerScreen(viewModel: ServerViewModel) {
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.SemiBold
         )
-        OutlinedTextField(
-            value = deviceName,
-            onValueChange = viewModel::updateDeviceName,
-            label = { Text("Device name") },
-            modifier = Modifier.fillMaxWidth()
-        )
         Button(
             onClick = {
                 if (hasPermissions(context, advertisePermissions)) {
@@ -89,26 +83,36 @@ fun ServerScreen(viewModel: ServerViewModel) {
                     advertisePermissionLauncher.launch(advertisePermissions)
                 }
             },
-            enabled = !isAdvertising,
+            enabled = !isAdvertising && !hasActiveConnection,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(text = "Start advertising")
         }
         OutlinedButton(
             onClick = viewModel::stopAdvertising,
-            enabled = isAdvertising,
+            enabled = isAdvertising && !hasActiveConnection,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(text = "Stop advertising")
+        }
+        if (hasActiveConnection) {
+            OutlinedButton(
+                onClick = viewModel::disconnect,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(text = "Disconnect")
+            }
         }
         OutlinedTextField(
             value = outputText,
             onValueChange = { outputText = it },
             label = { Text("Output characteristic value (server -> client)") },
+            enabled = hasActiveConnection,
             modifier = Modifier.fillMaxWidth()
         )
         Button(
             onClick = { viewModel.sendServerOutputCharacteristic(outputText) },
+            enabled = hasActiveConnection,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(text = "Write Output Characteristic")

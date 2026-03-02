@@ -20,11 +20,11 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     private val _connectionState = MutableStateFlow("Idle")
     val connectionState: StateFlow<String> = _connectionState.asStateFlow()
 
-    private val _deviceName = MutableStateFlow("1000")
-    val deviceName: StateFlow<String> = _deviceName.asStateFlow()
-
     private val _isAdvertising = MutableStateFlow(false)
     val isAdvertising: StateFlow<Boolean> = _isAdvertising.asStateFlow()
+
+    private val _hasActiveConnection = MutableStateFlow(false)
+    val hasActiveConnection: StateFlow<Boolean> = _hasActiveConnection.asStateFlow()
 
     private val _serverConnectionStatus = MutableStateFlow("Waiting for clients")
     val serverConnectionStatus: StateFlow<String> = _serverConnectionStatus.asStateFlow()
@@ -34,13 +34,10 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _serverWriteStatus = MutableStateFlow("Idle")
     val serverWriteStatus: StateFlow<String> = _serverWriteStatus.asStateFlow()
+    private val connectedClientAddresses = linkedSetOf<String>()
 
     init {
         observeServerEvents()
-    }
-
-    fun updateDeviceName(newName: String) {
-        _deviceName.value = stripAdvertisingPrefix(newName)
     }
 
     fun onAdvertisingPermissionDenied() {
@@ -49,12 +46,10 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun startAdvertising() {
-        val friendlyName = ensureAdvertisingPrefix(_deviceName.value)
-        _isAdvertising.value = true
-        _serverConnectionStatus.value = "Starting BLE server as $friendlyName"
+        _serverConnectionStatus.value = "Starting BLE server"
         _connectionState.value = "Server starting"
         serverManager.startServer()
-        serverManager.startAdvertising(friendlyName)
+        serverManager.startAdvertising()
     }
 
     fun stopAdvertising() {
@@ -62,6 +57,10 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         _serverConnectionStatus.value = "Advertising stopped"
         _connectionState.value = "Server stopped"
         serverManager.stopServer()
+    }
+
+    fun disconnect() {
+        serverManager.disconnectConnectedClients()
     }
 
     fun sendServerOutputCharacteristic(text: String) {
@@ -87,20 +86,31 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         _connectionState.value = "Server ready"
                     }
                     BleServerConnectionEvent.ServerStopped -> {
+                        connectedClientAddresses.clear()
+                        _hasActiveConnection.value = false
+                        _isAdvertising.value = false
                         _serverConnectionStatus.value = "Server stopped"
                     }
                     BleServerConnectionEvent.AdvertisingStarted -> {
+                        _isAdvertising.value = true
                         _serverConnectionStatus.value = "Advertising started"
                         _connectionState.value = "Server advertising"
                     }
                     BleServerConnectionEvent.AdvertisingStopped -> {
+                        _isAdvertising.value = false
                         _serverConnectionStatus.value = "Advertising stopped"
                     }
                     is BleServerConnectionEvent.DeviceConnected -> {
+                        connectedClientAddresses += event.address
+                        _hasActiveConnection.value = connectedClientAddresses.isNotEmpty()
                         _serverConnectionStatus.value = "Client connected: ${event.address}"
+                        _connectionState.value = "Client connected"
                     }
                     is BleServerConnectionEvent.DeviceDisconnected -> {
+                        connectedClientAddresses -= event.address
+                        _hasActiveConnection.value = connectedClientAddresses.isNotEmpty()
                         _serverConnectionStatus.value = "Client disconnected: ${event.address}"
+                        _connectionState.value = "Client disconnected"
                     }
                     is BleServerConnectionEvent.InputCharacteristicValueReceived -> {
                         _serverInputCharacteristicValue.value = toDisplay(event.value)
@@ -124,16 +134,5 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         val text = value.decodeToString()
         val hex = value.joinToString(" ") { b -> "%02X".format(b) }
         return "$text (hex: $hex)"
-    }
-
-    private fun ensureAdvertisingPrefix(name: String): String {
-        val trimmed = stripAdvertisingPrefix(name).ifBlank { "1000" }
-        return "${BluetoothGattProfile.ADVERTISING_NAME_PREFIX}_$trimmed".trim()
-    }
-
-    private fun stripAdvertisingPrefix(name: String): String {
-        val trimmed = name.trim()
-        val pattern = Regex("^${Regex.escape(BluetoothGattProfile.ADVERTISING_NAME_PREFIX)}\\s*", RegexOption.IGNORE_CASE)
-        return trimmed.replaceFirst(pattern, "").trim()
     }
 }
