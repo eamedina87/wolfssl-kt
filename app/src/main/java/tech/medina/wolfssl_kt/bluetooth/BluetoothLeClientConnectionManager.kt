@@ -12,7 +12,6 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.bluetooth.le.ScanCallback.SCAN_FAILED_ALREADY_STARTED
@@ -90,17 +89,13 @@ class BluetoothLeClientConnectionManager(
             return
         }
 
-        /*val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(BluetoothGattProfile.SERVICE_UUID))
-            .build()*/
-
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
         scanResults.clear()
         _discoveredDevices.value = emptyList()
-        bleScanner.startScan(listOf(), settings, scanCallback)
+        bleScanner.startScan(null, settings, scanCallback)
         isScanning = true
         emitEvent(BleClientConnectionEvent.ScanStarted)
     }
@@ -201,6 +196,13 @@ class BluetoothLeClientConnectionManager(
 
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (ENABLE_SCAN_DIAGNOSTICS) {
+                Log.d(
+                    TAG,
+                    "Scan callback: cb=$callbackType addr=${result.device.address} " +
+                        "name=${result.device.name} rssi=${result.rssi}"
+                )
+            }
             val scanRecord = result.scanRecord ?: return
             if (ENABLE_SCAN_DIAGNOSTICS) {
                 logScanResult(callbackType, result)
