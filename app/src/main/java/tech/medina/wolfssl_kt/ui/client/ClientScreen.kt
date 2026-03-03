@@ -46,6 +46,8 @@ fun ClientScreen(viewModel: ClientViewModel) {
     val transportState by viewModel.connectionState.collectAsState()
     val latestOutputValue by viewModel.clientOutputCharacteristicValue.collectAsState()
     val writeStatus by viewModel.clientWriteStatus.collectAsState()
+    val hasActiveConnection by viewModel.hasActiveConnection.collectAsState()
+    val tlsStatus by viewModel.tlsStatus.collectAsState()
     var inputText by remember { mutableStateOf("") }
     val scanPermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -158,6 +160,13 @@ fun ClientScreen(viewModel: ClientViewModel) {
                 Text(text = "Disconnect")
             }
         }
+        OutlinedButton(
+            onClick = viewModel::launchTlsConnection,
+            enabled = hasActiveConnection,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(text = "Launch TLS")
+        }
         Text(
             text = "Selected server: ${selectedServer ?: "None"}",
             style = MaterialTheme.typography.bodyMedium
@@ -168,6 +177,10 @@ fun ClientScreen(viewModel: ClientViewModel) {
         )
         Text(
             text = "Connection state: $transportState",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Text(
+            text = "TLS state: $tlsStatus",
             style = MaterialTheme.typography.bodyMedium
         )
         OutlinedTextField(

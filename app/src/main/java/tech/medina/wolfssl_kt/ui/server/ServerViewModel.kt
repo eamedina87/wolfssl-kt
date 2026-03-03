@@ -7,10 +7,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import tech.medina.wolfssl.kt.WolfSslKt
 import tech.medina.wolfssl_kt.bluetooth.BleServerConnectionEvent
 import tech.medina.wolfssl_kt.bluetooth.BluetoothGattProfile
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeServerConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
+import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
 
 class ServerViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -34,7 +36,10 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _serverWriteStatus = MutableStateFlow("Idle")
     val serverWriteStatus: StateFlow<String> = _serverWriteStatus.asStateFlow()
+    private val _tlsStatus = MutableStateFlow("TLS idle")
+    val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
     private val connectedClientAddresses = linkedSetOf<String>()
+    private var isTlsPrepared = false
 
     init {
         observeServerEvents()
@@ -63,6 +68,23 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         serverManager.disconnectConnectedClients()
     }
 
+    fun launchTlsConnection() {
+        if (!_hasActiveConnection.value) {
+            _tlsStatus.value = "Connect BLE first"
+            return
+        }
+        if (!isTlsPrepared) {
+            _tlsStatus.value = "TLS not prepared yet"
+            return
+        }
+        _tlsStatus.value = "Launching TLS handshake..."
+        val result = WolfSslKt.startConnection()
+        _tlsStatus.value = result.fold(
+            onSuccess = { "TLS connected" },
+            onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
+        )
+    }
+
     fun sendServerOutputCharacteristic(text: String) {
         if (text.isBlank()) {
             _serverWriteStatus.value = "Input is empty"
@@ -75,6 +97,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         super.onCleared()
         serverManager.stopServer()
+        WolfSslKt.clear()
     }
 
     private fun observeServerEvents() {
@@ -89,6 +112,8 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         connectedClientAddresses.clear()
                         _hasActiveConnection.value = false
                         _isAdvertising.value = false
+                        isTlsPrepared = false
+                        _tlsStatus.value = "TLS idle"
                         _serverConnectionStatus.value = "Server stopped"
                     }
                     BleServerConnectionEvent.AdvertisingStarted -> {
@@ -105,12 +130,18 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         _hasActiveConnection.value = connectedClientAddresses.isNotEmpty()
                         _serverConnectionStatus.value = "Client connected: ${event.address}"
                         _connectionState.value = "Client connected"
+                        prepareTlsConnection()
                     }
                     is BleServerConnectionEvent.DeviceDisconnected -> {
                         connectedClientAddresses -= event.address
                         _hasActiveConnection.value = connectedClientAddresses.isNotEmpty()
                         _serverConnectionStatus.value = "Client disconnected: ${event.address}"
                         _connectionState.value = "Client disconnected"
+                        if (!_hasActiveConnection.value) {
+                            isTlsPrepared = false
+                            _tlsStatus.value = "TLS idle"
+                            WolfSslKt.clear()
+                        }
                     }
                     is BleServerConnectionEvent.InputCharacteristicValueReceived -> {
                         _serverInputCharacteristicValue.value = toDisplay(event.value)
@@ -134,5 +165,34 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         val text = value.decodeToString()
         val hex = value.joinToString(" ") { b -> "%02X".format(b) }
         return "$text (hex: $hex)"
+    }
+
+    private fun prepareTlsConnection() {
+        val appContext = getApplication<Application>()
+        val materialsResult = TlsMaterialProvider.loadForRole(
+            appContext,
+            TlsMaterialProvider.EndpointRole.SERVER
+        )
+        if (materialsResult.isFailure) {
+            _tlsStatus.value = "TLS prepare failed: ${materialsResult.exceptionOrNull()?.message ?: "Could not load TLS material"}"
+            isTlsPrepared = false
+            return
+        }
+        WolfSslKt.clear()
+        val materials = materialsResult.getOrThrow()
+        val prepareResult = WolfSslKt.prepareTls13Connection(
+            cipher = WolfSslKt.SupportedCipher.TLS_CHACHA20_POLY1305_SHA256,
+            mode = WolfSslKt.TlsMode.SERVER,
+            pemPrivateKey = materials.privateKey,
+            caCertificate = materials.caCertificate,
+            certificateChain = materials.certificateChain,
+            incomingEncryptedDataChannel = bluetoothProvider.incomingChannel,
+            outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel
+        )
+        isTlsPrepared = prepareResult.isSuccess
+        _tlsStatus.value = prepareResult.fold(
+            onSuccess = { "TLS prepared (server). Tap Launch TLS." },
+            onFailure = { "TLS prepare failed: ${it.message ?: "Unknown error"}" }
+        )
     }
 }

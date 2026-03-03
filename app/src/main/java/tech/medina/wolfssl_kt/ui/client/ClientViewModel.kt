@@ -9,9 +9,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import tech.medina.wolfssl.kt.WolfSslKt
 import tech.medina.wolfssl_kt.bluetooth.BleClientConnectionEvent
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeClientConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
+import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
 
 class ClientViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -40,6 +42,11 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _clientWriteStatus = MutableStateFlow("Idle")
     val clientWriteStatus: StateFlow<String> = _clientWriteStatus.asStateFlow()
+    private val _hasActiveConnection = MutableStateFlow(false)
+    val hasActiveConnection: StateFlow<Boolean> = _hasActiveConnection.asStateFlow()
+    private val _tlsStatus = MutableStateFlow("TLS idle")
+    val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
+    private var isTlsPrepared = false
 
     init {
         observeDiscoveredDevices()
@@ -103,12 +110,34 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         _isScanning.value = false
         _clientConnectionStatus.value = "Disconnected"
         _connectionState.value = "Client disconnected"
+        _hasActiveConnection.value = false
+        isTlsPrepared = false
+        _tlsStatus.value = "TLS idle"
+        WolfSslKt.clear()
+    }
+
+    fun launchTlsConnection() {
+        if (!_hasActiveConnection.value) {
+            _tlsStatus.value = "Connect BLE first"
+            return
+        }
+        if (!isTlsPrepared) {
+            _tlsStatus.value = "TLS not prepared yet"
+            return
+        }
+        _tlsStatus.value = "Launching TLS handshake..."
+        val result = WolfSslKt.startConnection()
+        _tlsStatus.value = result.fold(
+            onSuccess = { "TLS connected" },
+            onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
+        )
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun onCleared() {
         super.onCleared()
         clientManager.close()
+        WolfSslKt.clear()
     }
 
     private fun observeDiscoveredDevices() {
@@ -147,14 +176,19 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                     is BleClientConnectionEvent.Connected -> {
                         _clientConnectionStatus.value = "Connected to ${event.address}"
                         _connectionState.value = "Client connected"
+                        _hasActiveConnection.value = true
                     }
                     is BleClientConnectionEvent.Disconnected -> {
                         _clientConnectionStatus.value = "Disconnected from ${event.address}"
                         _connectionState.value = "Client disconnected"
+                        _hasActiveConnection.value = false
+                        isTlsPrepared = false
+                        _tlsStatus.value = "TLS idle"
                     }
                     is BleClientConnectionEvent.ServicesReady -> {
                         _clientConnectionStatus.value = "Services ready on ${event.address}"
                         _connectionState.value = "Client ready"
+                        prepareTlsConnection()
                     }
                     is BleClientConnectionEvent.OutputCharacteristicValueReceived -> {
                         _clientOutputCharacteristicValue.value = toDisplay(event.value)
@@ -181,5 +215,34 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         val text = value.decodeToString()
         val hex = value.joinToString(" ") { b -> "%02X".format(b) }
         return "$text (hex: $hex)"
+    }
+
+    private fun prepareTlsConnection() {
+        val appContext = getApplication<Application>()
+        val materialsResult = TlsMaterialProvider.loadForRole(
+            appContext,
+            TlsMaterialProvider.EndpointRole.CLIENT
+        )
+        if (materialsResult.isFailure) {
+            _tlsStatus.value = "TLS prepare failed: ${materialsResult.exceptionOrNull()?.message ?: "Could not load TLS material"}"
+            isTlsPrepared = false
+            return
+        }
+        WolfSslKt.clear()
+        val materials = materialsResult.getOrThrow()
+        val prepareResult = WolfSslKt.prepareTls13Connection(
+            cipher = WolfSslKt.SupportedCipher.TLS_CHACHA20_POLY1305_SHA256,
+            mode = WolfSslKt.TlsMode.CLIENT,
+            pemPrivateKey = materials.privateKey,
+            caCertificate = materials.caCertificate,
+            certificateChain = materials.certificateChain,
+            incomingEncryptedDataChannel = bluetoothProvider.incomingChannel,
+            outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel
+        )
+        isTlsPrepared = prepareResult.isSuccess
+        _tlsStatus.value = prepareResult.fold(
+            onSuccess = { "TLS prepared (client). Tap Launch TLS." },
+            onFailure = { "TLS prepare failed: ${it.message ?: "Unknown error"}" }
+        )
     }
 }
