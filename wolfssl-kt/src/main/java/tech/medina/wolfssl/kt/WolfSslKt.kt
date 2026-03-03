@@ -32,6 +32,7 @@ private fun Int.checkSuccessful() {
 
 object WolfSslKt {
 
+    private var currentMode: TlsMode? = null
     private var currentSessionTicket: ByteArray? = null
     private lateinit var receiveJob: Job
 
@@ -88,17 +89,19 @@ object WolfSslKt {
             if (currentSession != null) {
                 throw IllegalStateException("There's a session already created. Stop or release current session before creating a new one.")
             }
+            currentMode = mode
+            val internalChannel = Channel<Byte>(capacity = UNLIMITED)
             val context = WolfSSLContext(mode.value)
             with(context) {
-                setVerify(SSL_VERIFY_NONE, //SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, //SSL_VERIFY_NONE TO START
-                     { preverifyOk : Int, x509StorePtr: Long ->
-                        //preverify_ok: Int,
-                        //x509StorePtr: Long
-                        1 //0 if it should stop, 1 if it should continue
-                    })
+                val verifyMode = when (mode) {
+                    TlsMode.CLIENT -> SSL_VERIFY_PEER
+                    TlsMode.SERVER -> SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+                }
+                setVerify(verifyMode, null)
                 setCipherList(cipher.value).checkSuccessful()
                 loadVerifyBuffer(caCertificate, caCertificate.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
-                val internalChannel = Channel<Byte>(capacity = UNLIMITED)
+                useCertificateChainBufferFormat(certificateChain, certificateChain.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
+                usePrivateKeyBuffer(pemPrivateKey, pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
                 receiveJob = appScope.launch {
                     incomingEncryptedDataChannel.receiveAsFlow()
                         .buffer(UNLIMITED)
@@ -108,14 +111,10 @@ object WolfSslKt {
                             }
                         }
                 }
+            }
+            currentSession = WolfSSLSession(context)
+            with(currentSession!!) {
                 setIORecv { session: WolfSSLSession, buffer: ByteArray, size: Int, context: Any ->
-                    //here we receive the encrypted data from the peer and decrypt it
-                    /*if (session.session == currentSession?.session) {
-
-                    }*/
-                    //we must read the given (size) bytes from the source
-                    //and then add to the data buffer
-                    //the return the amount of bytes read
                     runBlocking {
                         for (i in 0 until size) {
                             buffer[i] = internalChannel.receive()
@@ -124,15 +123,11 @@ object WolfSslKt {
                     }
                 }
                 setIOSend { session: WolfSSLSession, buffer: ByteArray, size: Int, context: Any ->
-                    //here we receive the encrypted data to be sent to the peer
                     runBlocking {
                         outgoingEncryptedDataChannel.send(buffer.copyOf(size))
                         size
                     }
                 }
-            }
-            currentSession = WolfSSLSession(context)
-            with(currentSession!!) {
                 when (mode) {
                     TlsMode.CLIENT -> {
                         setConnectState()
@@ -154,15 +149,17 @@ object WolfSslKt {
                 }
                 usingNonblock = 1
                 useSessionTicket()
-                useCertificateChainBufferFormat(certificateChain, certificateChain.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
-                usePrivateKeyBuffer(pemPrivateKey, pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
+
 
             }
             //pending informs the amount of bytes that are pending to be read
+            Log.i("WolfSSL-Kt", "WolfSSL session created successfully")
             Result.success(Unit)
         } catch (e: WolfSSLException) {
+            Log.e("WolfSSL-Kt", "Exception preparing connection: ${e.message}")
             Result.failure(e)
         } catch (e: IllegalStateException) {
+            Log.e("WolfSSL-Kt", "Exception preparing connection: ${e.message}")
             Result.failure(e)
         }
     }
