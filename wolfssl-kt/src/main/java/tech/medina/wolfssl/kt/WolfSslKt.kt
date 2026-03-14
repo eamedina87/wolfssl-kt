@@ -20,7 +20,6 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 
@@ -31,6 +30,7 @@ private fun Int.checkSuccessful() {
 }
 
 object WolfSslKt {
+    private const val TAG = "WolfSSL-Kt"
 
     private var currentMode: TlsMode? = null
     private var currentSessionTicket: ByteArray? = null
@@ -90,7 +90,8 @@ object WolfSslKt {
                 throw IllegalStateException("There's a session already created. Stop or release current session before creating a new one.")
             }
             currentMode = mode
-            val internalChannel = Channel<Byte>(capacity = UNLIMITED)
+            val inboundBuffer = ArrayDeque<Byte>()
+            val inboundLock = Any()
             val context = WolfSSLContext(mode.value)
             with(context) {
                 val verifyMode = when (mode) {
@@ -106,26 +107,41 @@ object WolfSslKt {
                     incomingEncryptedDataChannel.receiveAsFlow()
                         .buffer(UNLIMITED)
                         .collect { chunk ->
-                            chunk.forEach {
-                                internalChannel.send(it)
+                            synchronized(inboundLock) {
+                                chunk.forEach { inboundBuffer.addLast(it) }
                             }
                         }
                 }
             }
             currentSession = WolfSSLSession(context)
             with(currentSession!!) {
-                setIORecv { session: WolfSSLSession, buffer: ByteArray, size: Int, context: Any ->
-                    runBlocking {
-                        for (i in 0 until size) {
-                            buffer[i] = internalChannel.receive()
+                setIORecv { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
+                    synchronized(inboundLock) {
+                        if (inboundBuffer.isEmpty()) {
+                            Log.d(TAG, "TLS recv: no data available, returning WANT_READ")
+                            return@setIORecv WOLFSSL_CBIO_ERR_WANT_READ
                         }
-                        size
+
+                        var bytesRead = 0
+                        while (bytesRead < size && inboundBuffer.isNotEmpty()) {
+                            buffer[bytesRead] = inboundBuffer.removeFirst()
+                            bytesRead++
+                        }
+                        Log.d(
+                            TAG,
+                            "TLS recv: requested=$size read=$bytesRead remaining=${inboundBuffer.size}"
+                        )
+                        bytesRead
                     }
                 }
-                setIOSend { session: WolfSSLSession, buffer: ByteArray, size: Int, context: Any ->
-                    runBlocking {
-                        outgoingEncryptedDataChannel.send(buffer.copyOf(size))
+                setIOSend { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
+                    val result = outgoingEncryptedDataChannel.trySend(buffer.copyOf(size))
+                    if (result.isSuccess) {
+                        Log.d(TAG, "TLS send: queued=$size")
                         size
+                    } else {
+                        Log.d(TAG, "TLS send: queue full, returning WANT_WRITE")
+                        WOLFSSL_CBIO_ERR_WANT_WRITE
                     }
                 }
                 when (mode) {
@@ -181,11 +197,17 @@ object WolfSslKt {
                 TlsMode.CLIENT -> session.connect(timeoutMs)
                 TlsMode.SERVER -> session.accept(timeoutMs)
             }
+            Log.d(
+                TAG,
+                "TLS handshake: mode=$mode result=$connectionResult"
+            )
             if (connectionResult == SSL_SUCCESS) {
+                Log.i(TAG, "TLS handshake completed: mode=$mode")
                 return Result.success(Unit)
             }
 
             val error = session.getError(connectionResult)
+            Log.d(TAG, "TLS handshake: mode=$mode error=$error")
             val shouldRetry = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
                 error == -323 || error == -327
             if (!shouldRetry) {
