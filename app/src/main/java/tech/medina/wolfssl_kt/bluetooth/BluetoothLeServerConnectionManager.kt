@@ -228,11 +228,6 @@ class BluetoothLeServerConnectionManager(
                         server.notifyCharacteristicChanged(device, characteristic, true)
                     }
                 }
-                Log.d(
-                    TAG,
-                    "BLE server indicate: device=${device.address} packetSize=${packet.size} started=$started"
-                )
-
                 if (!started) {
                     synchronized(notifyAckLock) {
                         if (pendingNotifyAck === ack) {
@@ -253,10 +248,6 @@ class BluetoothLeServerConnectionManager(
                     emitEvent(BleServerConnectionEvent.Error("Indication timed out for ${device.address}"))
                     return
                 }
-                Log.d(
-                    TAG,
-                    "BLE server indicate complete: device=${device.address} packetSize=${packet.size} status=$status"
-                )
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     emitEvent(BleServerConnectionEvent.OutputCharacteristicWriteFailed(device.address, status))
                     return
@@ -324,7 +315,6 @@ class BluetoothLeServerConnectionManager(
         ) {
             if (characteristic.uuid == BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
-                Log.d(TAG, "BLE server recv: device=${device.address} packetSize=${value.size}")
                 emitEvent(BleServerConnectionEvent.InputCharacteristicValueReceived(value.copyOf()))
             }
 
@@ -347,11 +337,9 @@ class BluetoothLeServerConnectionManager(
                 when {
                     value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) -> {
                         subscribedDevices += device
-                        Log.d(TAG, "BLE server CCC enabled for ${device.address}")
                     }
                     value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) -> {
                         subscribedDevices -= device
-                        Log.d(TAG, "BLE server CCC disabled for ${device.address}")
                     }
                 }
             }

@@ -29,6 +29,17 @@ private fun Int.checkSuccessful() {
     }
 }
 
+private fun ByteArray.toHexString(): String =
+    joinToString(separator = " ") { "%02X".format(it) }
+
+private fun ByteArray.toLogString(): String =
+    buildString {
+        append("hex=")
+        append(this@toLogString.toHexString())
+        append(" text=")
+        append(this@toLogString.decodeToString())
+    }
+
 object WolfSslKt {
     private const val TAG = "WolfSSL-Kt"
 
@@ -118,7 +129,6 @@ object WolfSslKt {
                 setIORecv { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
                     synchronized(inboundLock) {
                         if (inboundBuffer.isEmpty()) {
-                            Log.d(TAG, "TLS recv: no data available, returning WANT_READ")
                             return@setIORecv WOLFSSL_CBIO_ERR_WANT_READ
                         }
 
@@ -127,20 +137,16 @@ object WolfSslKt {
                             buffer[bytesRead] = inboundBuffer.removeFirst()
                             bytesRead++
                         }
-                        Log.d(
-                            TAG,
-                            "TLS recv: requested=$size read=$bytesRead remaining=${inboundBuffer.size}"
-                        )
+                        Log.d(TAG, "TLS recv encrypted ($bytesRead): ${buffer.copyOf(bytesRead).toLogString()}")
                         bytesRead
                     }
                 }
                 setIOSend { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
                     val result = outgoingEncryptedDataChannel.trySend(buffer.copyOf(size))
                     if (result.isSuccess) {
-                        Log.d(TAG, "TLS send: queued=$size")
+                        Log.d(TAG, "TLS send encrypted ($size): ${buffer.copyOf(size).toLogString()}")
                         size
                     } else {
-                        Log.d(TAG, "TLS send: queue full, returning WANT_WRITE")
                         WOLFSSL_CBIO_ERR_WANT_WRITE
                     }
                 }
@@ -197,17 +203,12 @@ object WolfSslKt {
                 TlsMode.CLIENT -> session.connect(timeoutMs)
                 TlsMode.SERVER -> session.accept(timeoutMs)
             }
-            Log.d(
-                TAG,
-                "TLS handshake: mode=$mode result=$connectionResult"
-            )
             if (connectionResult == SSL_SUCCESS) {
                 Log.i(TAG, "TLS handshake completed: mode=$mode")
                 return Result.success(Unit)
             }
 
             val error = session.getError(connectionResult)
-            Log.d(TAG, "TLS handshake: mode=$mode error=$error")
             val shouldRetry = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
                 error == -323 || error == -327
             if (!shouldRetry) {
@@ -229,6 +230,7 @@ object WolfSslKt {
         if (currentSession!!.gotCloseNotify()) {
 
         }
+        Log.d(TAG, "TLS send decrypted (${dataToBeSent.size}): ${dataToBeSent.toLogString()}")
         val sentBytes = currentSession!!.write(dataToBeSent, dataToBeSent.size)
         return if (sentBytes == dataToBeSent.size) {
             //success
@@ -256,10 +258,14 @@ object WolfSslKt {
             }
             val readBytes = currentSession!!.read(buffer, buffer.size)
             if (readBytes > 0) {
-                emit(buffer.copyOf(readBytes))
+                val decrypted = buffer.copyOf(readBytes)
+                Log.d(TAG, "TLS recv decrypted ($readBytes): ${decrypted.toLogString()}")
+                emit(decrypted)
             } else {
                 val error = currentSession!!.getError(readBytes)
-                Log.e("WolfSSL", "Failed to read data. WolfSSL error: $error")
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                    Log.e("WolfSSL", "Failed to read data. WolfSSL error: $error")
+                }
             }
         }
 

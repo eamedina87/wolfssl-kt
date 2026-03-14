@@ -13,7 +13,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         appScope.launch {
-            WolfSslKt.init(appScope, enableLogging = true)
+            WolfSslKt.init(appScope, enableLogging = false)
         }
     }
 

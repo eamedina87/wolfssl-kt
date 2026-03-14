@@ -190,8 +190,6 @@ class BluetoothLeClientConnectionManager(
                         gatt.writeCharacteristic(characteristic)
                     }
                 }
-                Log.d(TAG, "BLE client write: packetSize=${packet.size} started=$started")
-
                 if (!started) {
                     synchronized(writeAckLock) {
                         if (pendingWriteAck === ack) {
@@ -214,7 +212,6 @@ class BluetoothLeClientConnectionManager(
                     return
                 }
 
-                Log.d(TAG, "BLE client write complete: packetSize=${packet.size} status=$status")
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
                     return
@@ -349,7 +346,6 @@ class BluetoothLeClientConnectionManager(
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
-                Log.d(TAG, "BLE client recv: packetSize=${value.size}")
                 emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
             }
         }
@@ -362,7 +358,6 @@ class BluetoothLeClientConnectionManager(
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 val value = characteristic.value ?: return
                 bluetoothProvider.publishIncoming(value)
-                Log.d(TAG, "BLE client recv: packetSize=${value.size}")
                 emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
             }
         }
@@ -454,7 +449,6 @@ class BluetoothLeClientConnectionManager(
             emitEvent(BleClientConnectionEvent.Error("Failed to write CCC descriptor, status=${status ?: "timeout"}"))
             return false
         }
-        Log.d(TAG, "BLE client CCC enabled")
         return true
     }
 
