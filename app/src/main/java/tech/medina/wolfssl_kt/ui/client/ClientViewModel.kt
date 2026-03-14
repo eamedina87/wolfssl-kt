@@ -122,6 +122,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun disconnect() {
+        viewModelScope.launch(Dispatchers.IO) {
+            WolfSslKt.release()
+        }
         clientManager.disconnect()
         _isScanning.value = false
         _clientConnectionStatus.value = "Disconnected"
@@ -133,7 +136,6 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         _isTlsConnected.value = false
         tlsReadJob?.cancel()
         tlsReadJob = null
-        WolfSslKt.clear()
     }
 
     fun launchTlsConnection() {

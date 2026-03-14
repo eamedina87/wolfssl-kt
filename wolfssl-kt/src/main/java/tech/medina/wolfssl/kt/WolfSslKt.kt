@@ -186,7 +186,7 @@ object WolfSslKt {
         }
     }
 
-    fun startConnection(timeoutMs: Int = 15000) : Result<Unit> {
+    fun startConnection(timeoutMs: Int = 60000) : Result<Unit> {
         //operate on the session
         //calling to accept when its a server, and connect when its a client
         //each method has a timeout
@@ -279,33 +279,35 @@ object WolfSslKt {
     //todo useSessionTicket
     //todo check if shutdown is inplace with getShutdown()
 
-    /*
-    Stops the current session, we can resume the connection with the session ticket internally stored
-     */
-    fun stop() {
-        //operate on the session
-        //freeSSL
-        currentSession!!.freeSSL()
-        receiveJob.cancel()
-    }
 
     /*
     Releases the current session, we can't resume the connection with the session ticket internally stored, so a new TLS handshake should be performed
      */
-    fun release() {
-        currentSession?.shutdownSSL()
+    fun release() : Result<Unit> {
+        return runCatching {
+            currentSession?.shutdownSSL()
+            currentSession?.freeSSL()
+            currentSession = null
+            currentMode = null
+            if (::receiveJob.isInitialized) {
+                receiveJob.cancel()
+            }
+        }
     }
 
     fun clear() : Result<Unit> {
         return try {
             currentSession?.shutdownSSL()
+            currentSession?.freeSSL()
             currentSession = null
             currentMode = null
+            if (::receiveJob.isInitialized) {
+                receiveJob.cancel()
+            }
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
-
     }
 
     enum class SupportedCipher(val value: String) {

@@ -70,6 +70,9 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun disconnect() {
+        viewModelScope.launch(Dispatchers.IO) {
+            WolfSslKt.release()
+        }
         serverManager.disconnectConnectedClients()
     }
 
