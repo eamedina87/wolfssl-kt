@@ -3,6 +3,7 @@ package tech.medina.wolfssl_kt.ui.server
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -40,6 +41,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
     private val connectedClientAddresses = linkedSetOf<String>()
     private var isTlsPrepared = false
+    private var isTlsLaunching = false
 
     init {
         observeServerEvents()
@@ -77,12 +79,19 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             _tlsStatus.value = "TLS not prepared yet"
             return
         }
+        if (isTlsLaunching) {
+            return
+        }
+        isTlsLaunching = true
         _tlsStatus.value = "Launching TLS handshake..."
-        val result = WolfSslKt.startConnection()
-        _tlsStatus.value = result.fold(
-            onSuccess = { "TLS connected" },
-            onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
-        )
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = WolfSslKt.startConnection()
+            isTlsLaunching = false
+            _tlsStatus.value = result.fold(
+                onSuccess = { "TLS connected" },
+                onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
+            )
+        }
     }
 
     fun sendServerOutputCharacteristic(text: String) {
@@ -113,6 +122,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         _hasActiveConnection.value = false
                         _isAdvertising.value = false
                         isTlsPrepared = false
+                        isTlsLaunching = false
                         _tlsStatus.value = "TLS idle"
                         _serverConnectionStatus.value = "Server stopped"
                     }
@@ -139,6 +149,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         _connectionState.value = "Client disconnected"
                         if (!_hasActiveConnection.value) {
                             isTlsPrepared = false
+                            isTlsLaunching = false
                             _tlsStatus.value = "TLS idle"
                             WolfSslKt.clear()
                         }

@@ -5,6 +5,7 @@ import android.app.Application
 import androidx.annotation.RequiresPermission
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,6 +48,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private val _tlsStatus = MutableStateFlow("TLS idle")
     val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
     private var isTlsPrepared = false
+    private var isTlsLaunching = false
 
     init {
         observeDiscoveredDevices()
@@ -125,12 +127,19 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
             _tlsStatus.value = "TLS not prepared yet"
             return
         }
+        if (isTlsLaunching) {
+            return
+        }
+        isTlsLaunching = true
         _tlsStatus.value = "Launching TLS handshake..."
-        val result = WolfSslKt.startConnection()
-        _tlsStatus.value = result.fold(
-            onSuccess = { "TLS connected" },
-            onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
-        )
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = WolfSslKt.startConnection()
+            isTlsLaunching = false
+            _tlsStatus.value = result.fold(
+                onSuccess = { "TLS connected" },
+                onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
+            )
+        }
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -183,6 +192,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         _connectionState.value = "Client disconnected"
                         _hasActiveConnection.value = false
                         isTlsPrepared = false
+                        isTlsLaunching = false
                         _tlsStatus.value = "TLS idle"
                     }
                     is BleClientConnectionEvent.ServicesReady -> {
