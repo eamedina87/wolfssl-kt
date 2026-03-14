@@ -164,20 +164,40 @@ object WolfSslKt {
         }
     }
 
-    fun startConnection() : Result<Unit> {
+    fun startConnection(timeoutMs: Int = 15000) : Result<Unit> {
         //operate on the session
         //calling to accept when its a server, and connect when its a client
         //each method has a timeout
         if (currentSession == null) {
             return Result.failure(WolfSSLException("First prepare a TLS connection with prepareTls13Connection and then connect"))
         }
-        val connectionResult = currentSession!!.connect(15000)
-        return if (connectionResult != SSL_SUCCESS) {
-            val error = currentSession!!.getError(connectionResult)
-            Result.failure(WolfSSLException("Failed to connect. WolfSSL error: $error"))
-        } else {
-            Result.success(Unit)
+        val mode = currentMode
+            ?: return Result.failure(WolfSSLException("TLS mode is unknown. Prepare TLS connection first"))
+        val session = currentSession!!
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            val connectionResult = when (mode) {
+                TlsMode.CLIENT -> session.connect(timeoutMs)
+                TlsMode.SERVER -> session.accept(timeoutMs)
+            }
+            if (connectionResult == SSL_SUCCESS) {
+                return Result.success(Unit)
+            }
+
+            val error = session.getError(connectionResult)
+            val shouldRetry = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
+                error == -323 || error == -327
+            if (!shouldRetry) {
+                val action = if (mode == TlsMode.CLIENT) "connect" else "accept"
+                return Result.failure(WolfSSLException("Failed to $action. WolfSSL error: $error"))
+            }
+
+            Thread.sleep(10)
         }
+
+        val action = if (mode == TlsMode.CLIENT) "connect" else "accept"
+        return Result.failure(WolfSSLException("Failed to $action within timeout=${timeoutMs}ms"))
     }
 
     fun send(dataToBeSent: ByteArray) : Result<Unit> {
@@ -252,6 +272,7 @@ object WolfSslKt {
         return try {
             currentSession?.shutdownSSL()
             currentSession = null
+            currentMode = null
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
