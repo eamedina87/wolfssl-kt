@@ -50,6 +50,7 @@ fun ClientScreen(viewModel: ClientViewModel) {
     val writeStatus by viewModel.clientWriteStatus.collectAsState()
     val hasActiveConnection by viewModel.hasActiveConnection.collectAsState()
     val tlsStatus by viewModel.tlsStatus.collectAsState()
+    val isTlsConnected by viewModel.isTlsConnected.collectAsState()
     var inputText by remember { mutableStateOf("") }
     val scanPermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -189,21 +190,22 @@ fun ClientScreen(viewModel: ClientViewModel) {
         OutlinedTextField(
             value = inputText,
             onValueChange = { inputText = it },
-            label = { Text("Input characteristic value (client -> server)") },
+            label = { Text("TLS payload (client -> server)") },
             modifier = Modifier.fillMaxWidth()
         )
         Button(
             onClick = { viewModel.sendClientInputCharacteristic(inputText) },
+            enabled = isTlsConnected,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(text = "Write Input Characteristic")
+            Text(text = "Send TLS Payload")
         }
         Text(
-            text = "Input write state: $writeStatus",
+            text = "TLS send state: $writeStatus",
             style = MaterialTheme.typography.bodyMedium
         )
         Text(
-            text = "Latest output characteristic: $latestOutputValue",
+            text = "Latest TLS payload: $latestOutputValue",
             style = MaterialTheme.typography.bodyMedium
         )
     }

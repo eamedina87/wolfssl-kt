@@ -40,6 +40,7 @@ fun ServerScreen(viewModel: ServerViewModel) {
     val latestInputValue by viewModel.serverInputCharacteristicValue.collectAsState()
     val writeStatus by viewModel.serverWriteStatus.collectAsState()
     val tlsStatus by viewModel.tlsStatus.collectAsState()
+    val isTlsConnected by viewModel.isTlsConnected.collectAsState()
     var outputText by remember { mutableStateOf("") }
     val advertisePermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -116,16 +117,16 @@ fun ServerScreen(viewModel: ServerViewModel) {
         OutlinedTextField(
             value = outputText,
             onValueChange = { outputText = it },
-            label = { Text("Output characteristic value (server -> client)") },
+            label = { Text("TLS payload (server -> client)") },
             enabled = hasActiveConnection,
             modifier = Modifier.fillMaxWidth()
         )
         Button(
             onClick = { viewModel.sendServerOutputCharacteristic(outputText) },
-            enabled = hasActiveConnection,
+            enabled = isTlsConnected,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(text = "Write Output Characteristic")
+            Text(text = "Send TLS Payload")
         }
         Text(
             text = "Advertising: ${if (isAdvertising) "On" else "Off"}",
@@ -136,11 +137,11 @@ fun ServerScreen(viewModel: ServerViewModel) {
             style = MaterialTheme.typography.bodyLarge
         )
         Text(
-            text = "Output write state: $writeStatus",
+            text = "TLS send state: $writeStatus",
             style = MaterialTheme.typography.bodyMedium
         )
         Text(
-            text = "Latest input characteristic: $latestInputValue",
+            text = "Latest TLS payload: $latestInputValue",
             style = MaterialTheme.typography.bodyMedium
         )
         Text(

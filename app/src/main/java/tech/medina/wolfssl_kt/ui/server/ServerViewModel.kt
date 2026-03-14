@@ -4,13 +4,13 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import tech.medina.wolfssl.kt.WolfSslKt
 import tech.medina.wolfssl_kt.bluetooth.BleServerConnectionEvent
-import tech.medina.wolfssl_kt.bluetooth.BluetoothGattProfile
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeServerConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
@@ -32,16 +32,19 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     private val _serverConnectionStatus = MutableStateFlow("Waiting for clients")
     val serverConnectionStatus: StateFlow<String> = _serverConnectionStatus.asStateFlow()
 
-    private val _serverInputCharacteristicValue = MutableStateFlow("No input characteristic value")
+    private val _serverInputCharacteristicValue = MutableStateFlow("No TLS payload received")
     val serverInputCharacteristicValue: StateFlow<String> = _serverInputCharacteristicValue.asStateFlow()
 
     private val _serverWriteStatus = MutableStateFlow("Idle")
     val serverWriteStatus: StateFlow<String> = _serverWriteStatus.asStateFlow()
     private val _tlsStatus = MutableStateFlow("TLS idle")
     val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
+    private val _isTlsConnected = MutableStateFlow(false)
+    val isTlsConnected: StateFlow<Boolean> = _isTlsConnected.asStateFlow()
     private val connectedClientAddresses = linkedSetOf<String>()
     private var isTlsPrepared = false
     private var isTlsLaunching = false
+    private var tlsReadJob: Job? = null
 
     init {
         observeServerEvents()
@@ -88,8 +91,15 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             val result = WolfSslKt.startConnection()
             isTlsLaunching = false
             _tlsStatus.value = result.fold(
-                onSuccess = { "TLS connected" },
-                onFailure = { "TLS connect failed: ${it.message ?: "Unknown error"}" }
+                onSuccess = {
+                    _isTlsConnected.value = true
+                    startTlsReader()
+                    "TLS connected"
+                },
+                onFailure = {
+                    _isTlsConnected.value = false
+                    "TLS connect failed: ${it.message ?: "Unknown error"}"
+                }
             )
         }
     }
@@ -99,12 +109,23 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             _serverWriteStatus.value = "Input is empty"
             return
         }
-        _serverWriteStatus.value = "Writing to output characteristic..."
-        serverManager.writeOutputCharacteristic(text.encodeToByteArray())
+        if (!_tlsStatus.value.startsWith("TLS connected")) {
+            _serverWriteStatus.value = "TLS is not connected"
+            return
+        }
+        _serverWriteStatus.value = "Sending TLS payload..."
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = WolfSslKt.send(text.encodeToByteArray())
+            _serverWriteStatus.value = result.fold(
+                onSuccess = { "TLS payload sent" },
+                onFailure = { "TLS send failed: ${it.message ?: "Unknown error"}" }
+            )
+        }
     }
 
     override fun onCleared() {
         super.onCleared()
+        tlsReadJob?.cancel()
         serverManager.stopServer()
         WolfSslKt.clear()
     }
@@ -124,6 +145,9 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                         isTlsPrepared = false
                         isTlsLaunching = false
                         _tlsStatus.value = "TLS idle"
+                        _isTlsConnected.value = false
+                        tlsReadJob?.cancel()
+                        tlsReadJob = null
                         _serverConnectionStatus.value = "Server stopped"
                     }
                     BleServerConnectionEvent.AdvertisingStarted -> {
@@ -151,11 +175,16 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                             isTlsPrepared = false
                             isTlsLaunching = false
                             _tlsStatus.value = "TLS idle"
+                            _isTlsConnected.value = false
+                            tlsReadJob?.cancel()
+                            tlsReadJob = null
                             WolfSslKt.clear()
                         }
                     }
                     is BleServerConnectionEvent.InputCharacteristicValueReceived -> {
-                        _serverInputCharacteristicValue.value = toDisplay(event.value)
+                        if (!_tlsStatus.value.startsWith("TLS connected")) {
+                            _serverInputCharacteristicValue.value = "Encrypted BLE packet: ${toDisplay(event.value)}"
+                        }
                     }
                     is BleServerConnectionEvent.OutputCharacteristicWriteSuccess -> {
                         _serverWriteStatus.value = "Output write success to ${event.address}"
@@ -187,6 +216,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         if (materialsResult.isFailure) {
             _tlsStatus.value = "TLS prepare failed: ${materialsResult.exceptionOrNull()?.message ?: "Could not load TLS material"}"
             isTlsPrepared = false
+            _isTlsConnected.value = false
             return
         }
         WolfSslKt.clear()
@@ -201,9 +231,19 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel
         )
         isTlsPrepared = prepareResult.isSuccess
+        _isTlsConnected.value = false
         _tlsStatus.value = prepareResult.fold(
             onSuccess = { "TLS prepared (server). Tap Launch TLS." },
             onFailure = { "TLS prepare failed: ${it.message ?: "Unknown error"}" }
         )
+    }
+
+    private fun startTlsReader() {
+        tlsReadJob?.cancel()
+        tlsReadJob = viewModelScope.launch(Dispatchers.IO) {
+            WolfSslKt.read(delay = 50).collect { data ->
+                _serverInputCharacteristicValue.value = toDisplay(data)
+            }
+        }
     }
 }
