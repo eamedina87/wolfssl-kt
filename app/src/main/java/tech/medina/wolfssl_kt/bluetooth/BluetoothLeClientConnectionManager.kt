@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -31,6 +32,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class DiscoveredBleDevice(
     val name: String?,
@@ -75,6 +79,11 @@ class BluetoothLeClientConnectionManager(
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var outgoingWriteJob: Job? = null
     private var isScanning = false
+    private val writeMutex = Mutex()
+    private val writeAckLock = Any()
+    private val descriptorAckLock = Any()
+    private var pendingWriteAck: CompletableDeferred<Int>? = null
+    private var pendingDescriptorAck: CompletableDeferred<Int>? = null
 
     @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN])
     fun startScan() {
@@ -142,7 +151,9 @@ class BluetoothLeClientConnectionManager(
     }
 
     fun writeInputCharacteristic(data: ByteArray) {
-        writeToServerCharacteristic(data)
+        scope.launch {
+            writeToServerCharacteristic(data)
+        }
     }
 
     private fun startOutgoingWriter() {
@@ -155,29 +166,59 @@ class BluetoothLeClientConnectionManager(
     }
 
     @SuppressLint("MissingPermission")
-    private fun writeToServerCharacteristic(data: ByteArray) {
-        val gatt = currentGatt ?: return
-        val characteristic = writeCharacteristic ?: return
+    private suspend fun writeToServerCharacteristic(data: ByteArray) {
+        writeMutex.withLock {
+            for (packet in BleTransport.chunk(data)) {
+                val gatt = currentGatt ?: return
+                val characteristic = writeCharacteristic ?: return
+                val ack = CompletableDeferred<Int>()
+                synchronized(writeAckLock) {
+                    pendingWriteAck = ack
+                }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = gatt.writeCharacteristic(
-                characteristic,
-                data,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            )
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
-            }
-            return
-        }
+                val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        characteristic,
+                        packet,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == BluetoothGatt.GATT_SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    run {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        characteristic.value = packet
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                }
+                Log.d(TAG, "BLE client write: packetSize=${packet.size} started=$started")
 
-        @Suppress("DEPRECATION")
-        run {
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            characteristic.value = data
-            val started = gatt.writeCharacteristic(characteristic)
-            if (!started) {
-                emitEvent(BleClientConnectionEvent.Error("Failed to start characteristic write"))
+                if (!started) {
+                    synchronized(writeAckLock) {
+                        if (pendingWriteAck === ack) {
+                            pendingWriteAck = null
+                        }
+                    }
+                    emitEvent(BleClientConnectionEvent.Error("Failed to start characteristic write"))
+                    return
+                }
+
+                val status = withTimeoutOrNull(GATT_OPERATION_TIMEOUT_MS) { ack.await() }
+                synchronized(writeAckLock) {
+                    if (pendingWriteAck === ack) {
+                        pendingWriteAck = null
+                    }
+                }
+
+                if (status == null) {
+                    emitEvent(BleClientConnectionEvent.Error("Characteristic write timed out"))
+                    return
+                }
+
+                Log.d(TAG, "BLE client write complete: packetSize=${packet.size} status=$status")
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
+                    return
+                }
             }
         }
     }
@@ -190,6 +231,14 @@ class BluetoothLeClientConnectionManager(
         notifyCharacteristic = null
         currentGatt?.close()
         currentGatt = null
+        synchronized(writeAckLock) {
+            pendingWriteAck?.complete(BluetoothGatt.GATT_FAILURE)
+            pendingWriteAck = null
+        }
+        synchronized(descriptorAckLock) {
+            pendingDescriptorAck?.complete(BluetoothGatt.GATT_FAILURE)
+            pendingDescriptorAck = null
+        }
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -287,14 +336,20 @@ class BluetoothLeClientConnectionManager(
                     return
                 }
 
-            enableNotifications(gatt, notifyCharacteristic!!)
-            startOutgoingWriter()
-            emitEvent(BleClientConnectionEvent.ServicesReady(gatt.device.address))
+            scope.launch {
+                val notificationsEnabled = enableNotifications(gatt, notifyCharacteristic!!)
+                if (!notificationsEnabled) {
+                    return@launch
+                }
+                startOutgoingWriter()
+                emitEvent(BleClientConnectionEvent.ServicesReady(gatt.device.address))
+            }
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
+                Log.d(TAG, "BLE client recv: packetSize=${value.size}")
                 emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
             }
         }
@@ -307,6 +362,7 @@ class BluetoothLeClientConnectionManager(
             if (characteristic.uuid == BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID) {
                 val value = characteristic.value ?: return
                 bluetoothProvider.publishIncoming(value)
+                Log.d(TAG, "BLE client recv: packetSize=${value.size}")
                 emitEvent(BleClientConnectionEvent.OutputCharacteristicValueReceived(value.copyOf()))
             }
         }
@@ -320,43 +376,86 @@ class BluetoothLeClientConnectionManager(
                 return
             }
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                synchronized(writeAckLock) {
+                    pendingWriteAck?.complete(status)
+                    pendingWriteAck = null
+                }
                 emitEvent(BleClientConnectionEvent.InputCharacteristicWriteSuccess)
             } else {
+                synchronized(writeAckLock) {
+                    pendingWriteAck?.complete(status)
+                    pendingWriteAck = null
+                }
                 emitEvent(BleClientConnectionEvent.CharacteristicWriteFailed(status))
+            }
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            synchronized(descriptorAckLock) {
+                pendingDescriptorAck?.complete(status)
+                pendingDescriptorAck = null
             }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+    private suspend fun enableNotifications(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ): Boolean {
         val notifySet = gatt.setCharacteristicNotification(characteristic, true)
         if (!notifySet) {
             emitEvent(BleClientConnectionEvent.Error("Failed to enable local notifications"))
-            return
+            return false
         }
 
         val descriptor = characteristic.getDescriptor(BluetoothGattProfile.CCC_DESCRIPTOR_UUID)
         if (descriptor == null) {
             emitEvent(BleClientConnectionEvent.Error("CCC descriptor not found"))
-            return
+            return false
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                emitEvent(BleClientConnectionEvent.Error("Failed to write CCC descriptor, status=$status"))
-            }
-            return
+        val ack = CompletableDeferred<Int>()
+        synchronized(descriptorAckLock) {
+            pendingDescriptorAck = ack
         }
 
-        @Suppress("DEPRECATION")
-        run {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            val started = gatt.writeDescriptor(descriptor)
-            if (!started) {
-                emitEvent(BleClientConnectionEvent.Error("Failed to start CCC descriptor write"))
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                descriptor.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                gatt.writeDescriptor(descriptor)
             }
         }
+
+        if (!started) {
+            synchronized(descriptorAckLock) {
+                if (pendingDescriptorAck === ack) {
+                    pendingDescriptorAck = null
+                }
+            }
+            emitEvent(BleClientConnectionEvent.Error("Failed to start CCC descriptor write"))
+            return false
+        }
+
+        val status = withTimeoutOrNull(GATT_OPERATION_TIMEOUT_MS) { ack.await() }
+        synchronized(descriptorAckLock) {
+            if (pendingDescriptorAck === ack) {
+                pendingDescriptorAck = null
+            }
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            emitEvent(BleClientConnectionEvent.Error("Failed to write CCC descriptor, status=${status ?: "timeout"}"))
+            return false
+        }
+        Log.d(TAG, "BLE client CCC enabled")
+        return true
     }
 
     private fun emitEvent(event: BleClientConnectionEvent) {
@@ -405,5 +504,6 @@ class BluetoothLeClientConnectionManager(
     private companion object {
         const val TAG = "BleClientConnectionManager"
         const val ENABLE_SCAN_DIAGNOSTICS = true
+        const val GATT_OPERATION_TIMEOUT_MS = 5_000L
     }
 }

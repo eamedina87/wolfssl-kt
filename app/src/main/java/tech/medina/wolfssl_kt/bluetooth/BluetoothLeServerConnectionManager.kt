@@ -23,10 +23,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed class BleServerConnectionEvent {
     data object ServerStarted : BleServerConnectionEvent()
@@ -58,8 +63,12 @@ class BluetoothLeServerConnectionManager(
     private var gattServer: BluetoothGattServer? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private val connectedDevices = LinkedHashSet<BluetoothDevice>()
+    private val subscribedDevices = LinkedHashSet<BluetoothDevice>()
     private var outgoingNotifyJob: Job? = null
     private var isAdvertising = false
+    private val notifyMutex = Mutex()
+    private val notifyAckLock = Any()
+    private var pendingNotifyAck: CompletableDeferred<Int>? = null
 
     @SuppressLint("MissingPermission")
     fun startServer() {
@@ -96,9 +105,14 @@ class BluetoothLeServerConnectionManager(
         outgoingNotifyJob?.cancel()
         outgoingNotifyJob = null
         connectedDevices.clear()
+        subscribedDevices.clear()
         notifyCharacteristic = null
         gattServer?.close()
         gattServer = null
+        synchronized(notifyAckLock) {
+            pendingNotifyAck?.complete(BluetoothGatt.GATT_FAILURE)
+            pendingNotifyAck = null
+        }
         emitEvent(BleServerConnectionEvent.ServerStopped)
     }
 
@@ -139,7 +153,9 @@ class BluetoothLeServerConnectionManager(
     }
 
     fun writeOutputCharacteristic(data: ByteArray) {
-        notifyConnectedDevices(data)
+        scope.launch {
+            notifyConnectedDevices(data)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -164,7 +180,7 @@ class BluetoothLeServerConnectionManager(
 
         val notify = BluetoothGattCharacteristic(
             BluetoothGattProfile.NOTIFY_CHARACTERISTIC_UUID,
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PROPERTY_INDICATE,
             BluetoothGattCharacteristic.PERMISSION_READ
         )
 
@@ -189,31 +205,75 @@ class BluetoothLeServerConnectionManager(
     }
 
     @SuppressLint("MissingPermission")
-    private fun notifyConnectedDevices(data: ByteArray) {
-        val server = gattServer ?: return
-        val characteristic = notifyCharacteristic ?: return
-        if (connectedDevices.isEmpty()) {
-            emitEvent(BleServerConnectionEvent.Error("No connected client for output characteristic write"))
-            return
-        }
-
-        connectedDevices.toList().forEach { device ->
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val status = server.notifyCharacteristicChanged(device, characteristic, false, data)
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    emitEvent(BleServerConnectionEvent.Error("Notify failed status=$status for ${device.address}"))
+    private suspend fun notifyConnectedDevices(data: ByteArray) {
+        notifyMutex.withLock {
+            for (packet in BleTransport.chunk(data)) {
+                val device = waitForSubscribedDevice() ?: run {
+                    emitEvent(BleServerConnectionEvent.Error("No subscribed client available for output characteristic write"))
+                    return
                 }
-            } else {
-                @Suppress("DEPRECATION")
-                run {
-                    characteristic.value = data
-                    val started = server.notifyCharacteristicChanged(device, characteristic, false)
-                    if (!started) {
-                        emitEvent(BleServerConnectionEvent.Error("Notify start failed for ${device.address}"))
+                val server = gattServer ?: return
+                val characteristic = notifyCharacteristic ?: return
+                val ack = CompletableDeferred<Int>()
+                synchronized(notifyAckLock) {
+                    pendingNotifyAck = ack
+                }
+
+                val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    server.notifyCharacteristicChanged(device, characteristic, true, packet) == BluetoothGatt.GATT_SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    run {
+                        characteristic.value = packet
+                        server.notifyCharacteristicChanged(device, characteristic, true)
                     }
+                }
+                Log.d(
+                    TAG,
+                    "BLE server indicate: device=${device.address} packetSize=${packet.size} started=$started"
+                )
+
+                if (!started) {
+                    synchronized(notifyAckLock) {
+                        if (pendingNotifyAck === ack) {
+                            pendingNotifyAck = null
+                        }
+                    }
+                    emitEvent(BleServerConnectionEvent.Error("Notify start failed for ${device.address}"))
+                    return
+                }
+
+                val status = withTimeoutOrNull(GATT_OPERATION_TIMEOUT_MS) { ack.await() }
+                synchronized(notifyAckLock) {
+                    if (pendingNotifyAck === ack) {
+                        pendingNotifyAck = null
+                    }
+                }
+                if (status == null) {
+                    emitEvent(BleServerConnectionEvent.Error("Indication timed out for ${device.address}"))
+                    return
+                }
+                Log.d(
+                    TAG,
+                    "BLE server indicate complete: device=${device.address} packetSize=${packet.size} status=$status"
+                )
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    emitEvent(BleServerConnectionEvent.OutputCharacteristicWriteFailed(device.address, status))
+                    return
                 }
             }
         }
+    }
+
+    private suspend fun waitForSubscribedDevice(): BluetoothDevice? {
+        repeat(DEVICE_WAIT_RETRIES) {
+            subscribedDevices.firstOrNull()?.let { return it }
+            if (connectedDevices.isEmpty()) {
+                return null
+            }
+            delay(DEVICE_WAIT_INTERVAL_MS)
+        }
+        return subscribedDevices.firstOrNull()
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -246,6 +306,7 @@ class BluetoothLeServerConnectionManager(
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectedDevices -= device
+                    subscribedDevices -= device
                     emitEvent(BleServerConnectionEvent.DeviceDisconnected(device.address))
                 }
             }
@@ -263,6 +324,7 @@ class BluetoothLeServerConnectionManager(
         ) {
             if (characteristic.uuid == BluetoothGattProfile.WRITE_CHARACTERISTIC_UUID) {
                 bluetoothProvider.publishIncoming(value)
+                Log.d(TAG, "BLE server recv: device=${device.address} packetSize=${value.size}")
                 emitEvent(BleServerConnectionEvent.InputCharacteristicValueReceived(value.copyOf()))
             }
 
@@ -281,12 +343,28 @@ class BluetoothLeServerConnectionManager(
             offset: Int,
             value: ByteArray
         ) {
+            if (descriptor.uuid == BluetoothGattProfile.CCC_DESCRIPTOR_UUID) {
+                when {
+                    value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) -> {
+                        subscribedDevices += device
+                        Log.d(TAG, "BLE server CCC enabled for ${device.address}")
+                    }
+                    value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) -> {
+                        subscribedDevices -= device
+                        Log.d(TAG, "BLE server CCC disabled for ${device.address}")
+                    }
+                }
+            }
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            synchronized(notifyAckLock) {
+                pendingNotifyAck?.complete(status)
+                pendingNotifyAck = null
+            }
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 emitEvent(BleServerConnectionEvent.OutputCharacteristicWriteSuccess(device.address))
             } else {
@@ -302,5 +380,8 @@ class BluetoothLeServerConnectionManager(
 
     private companion object {
         const val TAG = "BleServerConnectionManager"
+        const val GATT_OPERATION_TIMEOUT_MS = 5_000L
+        const val DEVICE_WAIT_INTERVAL_MS = 50L
+        const val DEVICE_WAIT_RETRIES = 100
     }
 }
