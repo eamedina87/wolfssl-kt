@@ -29,22 +29,10 @@ private fun Int.checkSuccessful() {
     }
 }
 
-private fun ByteArray.toHexString(): String =
-    joinToString(separator = " ") { "%02X".format(it) }
-
-private fun ByteArray.toLogString(): String =
-    buildString {
-        append("hex=")
-        append(this@toLogString.toHexString())
-        append(" text=")
-        append(this@toLogString.decodeToString())
-    }
-
-object WolfSslKt {
+object WolfSSLKt {
     private const val TAG = "WolfSSL-Kt"
 
     private var currentMode: TlsMode? = null
-    private var currentSessionTicket: ByteArray? = null
     private lateinit var receiveJob: Job
 
     //todo protect
@@ -60,6 +48,7 @@ object WolfSslKt {
         object Idle : WolfSSLKtState()
         object Loading : WolfSSLKtState()
         object Initialized : WolfSSLKtState()
+        class TlsConnected(val sessionTicket: ByteArray) : WolfSSLKtState()
 
         class Error(description: String) : WolfSSLKtState()
     }
@@ -90,11 +79,10 @@ object WolfSslKt {
     fun prepareTls13Connection(
         cipher: SupportedCipher,
         mode: TlsMode,
-        pemPrivateKey: ByteArray,
-        caCertificate: ByteArray,
-        certificateChain: ByteArray,
+        pkiData: PKIData,
         incomingEncryptedDataChannel: Channel<ByteArray>,
-        outgoingEncryptedDataChannel: Channel<ByteArray>
+        sendCallback: WolfSSLKtSendCallback,
+        previousSessionTicket: ByteArray? = null
     ) : Result<Unit> {
         return try {
             if (currentSession != null) {
@@ -111,9 +99,9 @@ object WolfSslKt {
                 }
                 setVerify(verifyMode, null)
                 setCipherList(cipher.value).checkSuccessful()
-                loadVerifyBuffer(caCertificate, caCertificate.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
-                useCertificateChainBufferFormat(certificateChain, certificateChain.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
-                usePrivateKeyBuffer(pemPrivateKey, pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
+                loadVerifyBuffer(pkiData.caCertificate, pkiData.caCertificate.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
+                useCertificateChainBufferFormat(pkiData.certificateChain, pkiData.certificateChain.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
+                usePrivateKeyBuffer(pkiData.pemPrivateKey, pkiData.pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
                 receiveJob = appScope.launch {
                     incomingEncryptedDataChannel.receiveAsFlow()
                         .buffer(UNLIMITED)
@@ -126,6 +114,7 @@ object WolfSslKt {
             }
             currentSession = WolfSSLSession(context)
             with(currentSession!!) {
+                //Set IO Recv callback receives encrypted data from the peer
                 setIORecv { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
                     synchronized(inboundLock) {
                         if (inboundBuffer.isEmpty()) {
@@ -141,19 +130,12 @@ object WolfSslKt {
                         bytesRead
                     }
                 }
-                setIOSend { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
-                    val result = outgoingEncryptedDataChannel.trySend(buffer.copyOf(size))
-                    if (result.isSuccess) {
-                        Log.d(TAG, "TLS send encrypted ($size): ${buffer.copyOf(size).toLogString()}")
-                        size
-                    } else {
-                        WOLFSSL_CBIO_ERR_WANT_WRITE
-                    }
-                }
+                //Set IO Send callback is where we receive the encrypted by WolfSSL that we must send to the peer
+                setIOSend(sendCallback)
                 when (mode) {
                     TlsMode.CLIENT -> {
                         setConnectState()
-                        currentSessionTicket?.let {
+                        previousSessionTicket?.let {
                             val sessionTicketResult = setSessionTicket(it)
                             if (sessionTicketResult != SSL_SUCCESS) {
                                 Log.e("WolfSSL-JNI", "Failed to set session ticket for resumption")
@@ -163,7 +145,9 @@ object WolfSslKt {
                         }
                         setSessionTicketCb({ session, sessionTicket, context ->
                             Log.d("WolfSSL-JNI", "Session ticket received for resumption")
-                            currentSessionTicket = sessionTicket
+                            appScope.launch {
+                                _state.emit(WolfSSLKtState.TlsConnected(sessionTicket))
+                            }
                             0
                         }, context)
                     }
@@ -171,8 +155,6 @@ object WolfSslKt {
                 }
                 usingNonblock = 1
                 useSessionTicket()
-
-
             }
             //pending informs the amount of bytes that are pending to be read
             Log.i("WolfSSL-Kt", "WolfSSL session created successfully")
@@ -209,6 +191,7 @@ object WolfSslKt {
             }
 
             val error = session.getError(connectionResult)
+            //WANT_READ and WANT_WRITE are non fatal errors, so we should retry
             val shouldRetry = error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
                 error == -323 || error == -327
             if (!shouldRetry) {
@@ -228,9 +211,10 @@ object WolfSslKt {
             return Result.failure(WolfSSLException("First prepare a TLS connection with prepareTls13Connection and then connect"))
         }
         if (currentSession!!.gotCloseNotify()) {
-
+            return Result.failure(WolfSSLException("TLS Connection already closed"))
         }
         Log.d(TAG, "TLS send decrypted (${dataToBeSent.size}): ${dataToBeSent.toLogString()}")
+        //Write decrypted data to the peer
         val sentBytes = currentSession!!.write(dataToBeSent, dataToBeSent.size)
         return if (sentBytes == dataToBeSent.size) {
             //success
@@ -254,6 +238,7 @@ object WolfSslKt {
                 return@flow
             }
             if (currentSession!!.gotCloseNotify()) {
+                release()
                 return@flow
             }
             val readBytes = currentSession!!.read(buffer, buffer.size)
@@ -276,7 +261,6 @@ object WolfSslKt {
     //todo check if a session is resumable
     //todo check if a session is done with handshakeDone
     //todo gotCloseNotify to check for shutdown
-    //todo useSessionTicket
     //todo check if shutdown is inplace with getShutdown()
 
 
@@ -317,15 +301,6 @@ object WolfSslKt {
     enum class TlsMode(val value: Long) {
         CLIENT(TLSv1_3_ClientMethod()),
         SERVER(TLSv1_3_ServerMethod())
-    }
-
-    private fun <T> checkNotNull(value: T?, name: String = "value"): T? {
-        if (value == null) {
-            val message = "Required $name was null"
-            Log.w("WolfSSL-JNI", message)
-            return null
-        }
-        return value
     }
 
 }

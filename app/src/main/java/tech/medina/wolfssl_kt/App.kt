@@ -4,7 +4,7 @@ import android.app.Application
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import tech.medina.wolfssl.kt.WolfSslKt
+import tech.medina.wolfssl.kt.WolfSSLKt
 
 class App : Application() {
 
@@ -13,7 +13,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         appScope.launch {
-            WolfSslKt.init(appScope, enableLogging = false)
+            WolfSSLKt.init(appScope, enableLogging = false)
         }
     }
 

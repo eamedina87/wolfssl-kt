@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import tech.medina.wolfssl.kt.WolfSslKt
+import tech.medina.wolfssl.kt.WolfSSLKt
 import tech.medina.wolfssl_kt.bluetooth.BleServerConnectionEvent
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeServerConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
@@ -71,7 +71,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun disconnect() {
         viewModelScope.launch(Dispatchers.IO) {
-            WolfSslKt.release()
+            WolfSSLKt.release()
         }
         serverManager.disconnectConnectedClients()
     }
@@ -91,7 +91,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         isTlsLaunching = true
         _tlsStatus.value = "Launching TLS handshake..."
         viewModelScope.launch(Dispatchers.IO) {
-            val result = WolfSslKt.startConnection()
+            val result = WolfSSLKt.startConnection()
             isTlsLaunching = false
             _tlsStatus.value = result.fold(
                 onSuccess = {
@@ -118,7 +118,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         }
         _serverWriteStatus.value = "Sending TLS payload..."
         viewModelScope.launch(Dispatchers.IO) {
-            val result = WolfSslKt.send(text.encodeToByteArray())
+            val result = WolfSSLKt.send(text.encodeToByteArray())
             _serverWriteStatus.value = result.fold(
                 onSuccess = { "TLS payload sent" },
                 onFailure = { "TLS send failed: ${it.message ?: "Unknown error"}" }
@@ -130,7 +130,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         tlsReadJob?.cancel()
         serverManager.stopServer()
-        WolfSslKt.clear()
+        WolfSSLKt.clear()
     }
 
     private fun observeServerEvents() {
@@ -181,7 +181,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                             _isTlsConnected.value = false
                             tlsReadJob?.cancel()
                             tlsReadJob = null
-                            WolfSslKt.clear()
+                            WolfSSLKt.clear()
                         }
                     }
                     is BleServerConnectionEvent.InputCharacteristicValueReceived -> {
@@ -222,11 +222,11 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             _isTlsConnected.value = false
             return
         }
-        WolfSslKt.clear()
+        WolfSSLKt.clear()
         val materials = materialsResult.getOrThrow()
-        val prepareResult = WolfSslKt.prepareTls13Connection(
-            cipher = WolfSslKt.SupportedCipher.TLS_CHACHA20_POLY1305_SHA256,
-            mode = WolfSslKt.TlsMode.SERVER,
+        val prepareResult = WolfSSLKt.prepareTls13Connection(
+            cipher = WolfSSLKt.SupportedCipher.TLS_CHACHA20_POLY1305_SHA256,
+            mode = WolfSSLKt.TlsMode.SERVER,
             pemPrivateKey = materials.privateKey,
             caCertificate = materials.caCertificate,
             certificateChain = materials.certificateChain,
@@ -244,7 +244,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     private fun startTlsReader() {
         tlsReadJob?.cancel()
         tlsReadJob = viewModelScope.launch(Dispatchers.IO) {
-            WolfSslKt.read(delay = 50).collect { data ->
+            WolfSSLKt.read(delay = 50).collect { data ->
                 _serverInputCharacteristicValue.value = toDisplay(data)
             }
         }
