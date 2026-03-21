@@ -7,9 +7,7 @@ import com.wolfssl.WolfSSLException
 import com.wolfssl.WolfSSLLoggingCallback
 import com.wolfssl.WolfSSLSession
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,7 +15,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
@@ -33,7 +30,7 @@ object WolfSSLKt {
     private const val TAG = "WolfSSL-Kt"
 
     private var currentMode: TlsMode? = null
-    private lateinit var receiveJob: Job
+    private var receiveCallback: WolfSSLKtReceiveCallback? = null
 
     //todo protect
     private var currentSession: WolfSSLSession? = null
@@ -89,8 +86,6 @@ object WolfSSLKt {
                 throw IllegalStateException("There's a session already created. Stop or release current session before creating a new one.")
             }
             currentMode = mode
-            val inboundBuffer = ArrayDeque<Byte>()
-            val inboundLock = Any()
             val context = WolfSSLContext(mode.value)
             with(context) {
                 val verifyMode = when (mode) {
@@ -102,34 +97,16 @@ object WolfSSLKt {
                 loadVerifyBuffer(pkiData.caCertificate, pkiData.caCertificate.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
                 useCertificateChainBufferFormat(pkiData.certificateChain, pkiData.certificateChain.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
                 usePrivateKeyBuffer(pkiData.pemPrivateKey, pkiData.pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
-                receiveJob = appScope.launch {
-                    incomingEncryptedDataChannel.receiveAsFlow()
-                        .buffer(UNLIMITED)
-                        .collect { chunk ->
-                            synchronized(inboundLock) {
-                                chunk.forEach { inboundBuffer.addLast(it) }
-                            }
-                        }
-                }
             }
             currentSession = WolfSSLSession(context)
+            val recvCallback = WolfSSLKtReceiveCallback(
+                appScope = appScope,
+                incomingEncryptedDataChannel = incomingEncryptedDataChannel,
+            )
+            receiveCallback = recvCallback
             with(currentSession!!) {
                 //Set IO Recv callback receives encrypted data from the peer
-                setIORecv { _: WolfSSLSession, buffer: ByteArray, size: Int, _: Any? ->
-                    synchronized(inboundLock) {
-                        if (inboundBuffer.isEmpty()) {
-                            return@setIORecv WOLFSSL_CBIO_ERR_WANT_READ
-                        }
-
-                        var bytesRead = 0
-                        while (bytesRead < size && inboundBuffer.isNotEmpty()) {
-                            buffer[bytesRead] = inboundBuffer.removeFirst()
-                            bytesRead++
-                        }
-                        Log.d(TAG, "TLS recv encrypted ($bytesRead): ${buffer.copyOf(bytesRead).toLogString()}")
-                        bytesRead
-                    }
-                }
+                setIORecv(recvCallback)
                 //Set IO Send callback is where we receive the encrypted by WolfSSL that we must send to the peer
                 setIOSend(sendCallback)
                 when (mode) {
@@ -273,9 +250,8 @@ object WolfSSLKt {
             currentSession?.freeSSL()
             currentSession = null
             currentMode = null
-            if (::receiveJob.isInitialized) {
-                receiveJob.cancel()
-            }
+            receiveCallback?.cancel()
+            receiveCallback = null
         }
     }
 
@@ -285,9 +261,8 @@ object WolfSSLKt {
             currentSession?.freeSSL()
             currentSession = null
             currentMode = null
-            if (::receiveJob.isInitialized) {
-                receiveJob.cancel()
-            }
+            receiveCallback?.cancel()
+            receiveCallback = null
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)

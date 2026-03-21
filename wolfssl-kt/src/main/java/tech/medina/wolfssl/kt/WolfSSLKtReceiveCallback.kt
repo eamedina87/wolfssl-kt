@@ -1,0 +1,56 @@
+package tech.medina.wolfssl.kt
+
+import android.util.Log
+import com.wolfssl.WolfSSL.WOLFSSL_CBIO_ERR_WANT_READ
+import com.wolfssl.WolfSSLIORecvCallback
+import com.wolfssl.WolfSSLSession
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.launch
+
+class WolfSSLKtReceiveCallback(
+    appScope: CoroutineScope,
+    incomingEncryptedDataChannel: Channel<ByteArray>,
+) : WolfSSLIORecvCallback {
+    private val inboundBuffer = ArrayDeque<Byte>()
+    private val inboundLock = Any()
+
+    private val receiveJob: Job = appScope.launch {
+        incomingEncryptedDataChannel.receiveAsFlow()
+            .buffer(UNLIMITED)
+            .collect { chunk ->
+                synchronized(inboundLock) {
+                    chunk.forEach { inboundBuffer.addLast(it) }
+                }
+            }
+    }
+
+    override fun receiveCallback(
+        ssl: WolfSSLSession?,
+        buffer: ByteArray,
+        size: Int,
+        ctx: Any?
+    ): Int {
+        return synchronized(inboundLock) {
+            if (inboundBuffer.isEmpty()) {
+                return@synchronized WOLFSSL_CBIO_ERR_WANT_READ
+            }
+
+            var bytesRead = 0
+            while (bytesRead < size && inboundBuffer.isNotEmpty()) {
+                buffer[bytesRead] = inboundBuffer.removeFirst()
+                bytesRead++
+            }
+            Log.d("WolfSSLKtReceiveCallback", "TLS recv encrypted ($bytesRead): ${buffer.copyOf(bytesRead).toLogString()}")
+            bytesRead
+        }
+    }
+
+    fun cancel() {
+        receiveJob.cancel()
+    }
+}
