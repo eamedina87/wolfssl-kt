@@ -12,7 +12,9 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 
-class WolfSSLKtReceiveCallback(
+// This is the callback that WolfSSL will use to receive encrypted data from the peer.
+// To instantiate this callback, you need to use the WolfSSLKt class factory method, since its constructor is internal.
+class WolfSSLKtReceiveCallback internal constructor(
     appScope: CoroutineScope,
     incomingEncryptedDataChannel: Channel<ByteArray>,
 ) : WolfSSLIORecvCallback {

@@ -7,13 +7,11 @@ import com.wolfssl.WolfSSLException
 import com.wolfssl.WolfSSLLoggingCallback
 import com.wolfssl.WolfSSLSession
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -73,11 +71,23 @@ object WolfSSLKt {
         }
     }
 
+    fun createReceiveCallback(
+        incomingEncryptedDataChannel: kotlinx.coroutines.channels.Channel<ByteArray>
+    ): WolfSSLKtReceiveCallback {
+        check(::appScope.isInitialized) {
+            "WolfSSLKt is not initialized. Call init() before creating the receive callback."
+        }
+        return WolfSSLKtReceiveCallback(
+            appScope = appScope,
+            incomingEncryptedDataChannel = incomingEncryptedDataChannel,
+        )
+    }
+
     fun prepareTls13Connection(
         cipher: SupportedCipher,
         mode: TlsMode,
         pkiData: PKIData,
-        incomingEncryptedDataChannel: Channel<ByteArray>,
+        receiveCallback: WolfSSLKtReceiveCallback,
         sendCallback: WolfSSLKtSendCallback,
         previousSessionTicket: ByteArray? = null
     ) : Result<Unit> {
@@ -99,14 +109,10 @@ object WolfSSLKt {
                 usePrivateKeyBuffer(pkiData.pemPrivateKey, pkiData.pemPrivateKey.size.toLong(), SSL_FILETYPE_PEM).checkSuccessful()
             }
             currentSession = WolfSSLSession(context)
-            val recvCallback = WolfSSLKtReceiveCallback(
-                appScope = appScope,
-                incomingEncryptedDataChannel = incomingEncryptedDataChannel,
-            )
-            receiveCallback = recvCallback
+            this.receiveCallback = receiveCallback
             with(currentSession!!) {
                 //Set IO Recv callback receives encrypted data from the peer
-                setIORecv(recvCallback)
+                setIORecv(receiveCallback)
                 //Set IO Send callback is where we receive the encrypted by WolfSSL that we must send to the peer
                 setIOSend(sendCallback)
                 when (mode) {
@@ -164,6 +170,7 @@ object WolfSSLKt {
             }
             if (connectionResult == SSL_SUCCESS) {
                 Log.i(TAG, "TLS handshake completed: mode=$mode")
+                Log.i(TAG, "Session reused :${session.sessionReused()}")
                 return Result.success(Unit)
             }
 
@@ -199,7 +206,7 @@ object WolfSSLKt {
         } else {
             //failure
             val error = currentSession!!.getError(sentBytes)
-            Log.e("WolfSSL", "Failed to read data. WolfSSL error: $error")
+            Log.e("WolfSSL", "Failed to send data. WolfSSL error: $error")
             Result.failure(WolfSSLException("Failed to send data: $dataToBeSent. WolfSSL error: $error"))
         }
     }
