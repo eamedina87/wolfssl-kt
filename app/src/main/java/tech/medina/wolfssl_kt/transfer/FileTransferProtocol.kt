@@ -3,6 +3,18 @@ package tech.medina.wolfssl_kt.transfer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+enum class FileTransferStrategy(val wireValue: Byte, val displayName: String) {
+    VERIFIED_STREAM(1, "Verified stream"),
+    TX_ONLY(2, "TX only"),
+    STOP_AND_WAIT(3, "Packet ACK (stop-and-wait)");
+
+    companion object {
+        fun fromWireValue(value: Byte): FileTransferStrategy =
+            entries.firstOrNull { it.wireValue == value }
+                ?: error("Unknown file transfer strategy $value")
+    }
+}
+
 internal object FileTransferProtocol {
     const val DIGEST_SIZE = 32
     const val MAX_FILE_NAME_BYTES = 255
@@ -16,8 +28,18 @@ internal object FileTransferProtocol {
     private val MAGIC = byteArrayOf('W'.code.toByte(), 'F'.code.toByte(), 'T'.code.toByte(), 'P'.code.toByte())
 
     sealed interface ControlMessage {
-        data class Start(val fileName: String, val fileSize: Long) : ControlMessage
+        data class Start(
+            val fileName: String,
+            val fileSize: Long,
+            val strategy: FileTransferStrategy,
+        ) : ControlMessage
+        data class Data(val sequence: Int, val bytes: ByteArray) : ControlMessage
         data class End(val sha256: ByteArray) : ControlMessage
+        data class PacketAck(
+            val sequence: Int,
+            val success: Boolean,
+            val message: String,
+        ) : ControlMessage
         data class Ack(
             val success: Boolean,
             val receivedBytes: Long,
@@ -33,21 +55,41 @@ internal object FileTransferProtocol {
         data class Invalid(val reason: String) : DecodeResult
     }
 
-    fun fileChunkSize(attPayloadSize: Int): Int =
-        minOf(TARGET_FILE_CHUNK_SIZE, (attPayloadSize - TLS_RECORD_OVERHEAD).coerceAtLeast(1))
+    fun fileChunkSize(attPayloadSize: Int, strategy: FileTransferStrategy): Int {
+        val framingOverhead = if (strategy == FileTransferStrategy.STOP_AND_WAIT) {
+            HEADER_SIZE + Int.SIZE_BYTES
+        } else {
+            0
+        }
+        return minOf(
+            TARGET_FILE_CHUNK_SIZE,
+            (attPayloadSize - TLS_RECORD_OVERHEAD - framingOverhead).coerceAtLeast(1),
+        )
+    }
 
-    fun encodeStart(fileName: String, fileSize: Long): ByteArray {
+    fun encodeStart(fileName: String, fileSize: Long, strategy: FileTransferStrategy): ByteArray {
         require(fileSize >= 0) { "fileSize must not be negative" }
         val name = fileName.encodeToByteArray()
         require(name.isNotEmpty()) { "fileName must not be empty" }
         require(name.size <= MAX_FILE_NAME_BYTES) { "fileName is too long" }
-        val payload = ByteBuffer.allocate(Long.SIZE_BYTES + Short.SIZE_BYTES + name.size)
+        val payload = ByteBuffer.allocate(1 + Long.SIZE_BYTES + Short.SIZE_BYTES + name.size)
             .order(ByteOrder.BIG_ENDIAN)
+            .put(strategy.wireValue)
             .putLong(fileSize)
             .putShort(name.size.toShort())
             .put(name)
             .array()
         return encode(TYPE_START, payload)
+    }
+
+    fun encodeData(sequence: Int, bytes: ByteArray): ByteArray {
+        require(sequence >= 0) { "sequence must not be negative" }
+        val payload = ByteBuffer.allocate(Int.SIZE_BYTES + bytes.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putInt(sequence)
+            .put(bytes)
+            .array()
+        return encode(TYPE_DATA, payload)
     }
 
     fun encodeEnd(sha256: ByteArray): ByteArray {
@@ -71,6 +113,18 @@ internal object FileTransferProtocol {
             .put(messageBytes)
             .array()
         return encode(TYPE_ACK, payload)
+    }
+
+    fun encodePacketAck(sequence: Int, success: Boolean, message: String = ""): ByteArray {
+        require(sequence >= 0) { "sequence must not be negative" }
+        val messageBytes = message.encodeToByteArray()
+        val payload = ByteBuffer.allocate(Int.SIZE_BYTES + 1 + messageBytes.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putInt(sequence)
+            .put(if (success) 1 else 0)
+            .put(messageBytes)
+            .array()
+        return encode(TYPE_PACKET_ACK, payload)
     }
 
     fun decode(bytes: ByteArray): DecodeResult {
@@ -112,8 +166,9 @@ internal object FileTransferProtocol {
 
     private fun decodePayload(type: Byte, payload: ByteArray): ControlMessage = when (type) {
         TYPE_START -> {
-            require(payload.size >= Long.SIZE_BYTES + Short.SIZE_BYTES) { "Start frame is too short" }
+            require(payload.size >= 1 + Long.SIZE_BYTES + Short.SIZE_BYTES) { "Start frame is too short" }
             val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            val strategy = FileTransferStrategy.fromWireValue(buffer.get())
             val fileSize = buffer.long
             val nameSize = buffer.short.toInt() and 0xffff
             require(fileSize >= 0) { "Negative file size" }
@@ -121,7 +176,15 @@ internal object FileTransferProtocol {
                 "Invalid file name size"
             }
             val name = ByteArray(nameSize).also(buffer::get).decodeToString()
-            ControlMessage.Start(name, fileSize)
+            ControlMessage.Start(name, fileSize, strategy)
+        }
+        TYPE_DATA -> {
+            require(payload.size >= Int.SIZE_BYTES) { "Data frame is too short" }
+            val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            val sequence = buffer.int
+            require(sequence >= 0) { "Negative packet sequence" }
+            val bytes = ByteArray(buffer.remaining()).also(buffer::get)
+            ControlMessage.Data(sequence, bytes)
         }
         TYPE_END -> {
             require(payload.size == DIGEST_SIZE) { "Invalid end digest size" }
@@ -136,10 +199,21 @@ internal object FileTransferProtocol {
             val message = ByteArray(buffer.remaining()).also(buffer::get).decodeToString()
             ControlMessage.Ack(success, receivedBytes, digest, message)
         }
+        TYPE_PACKET_ACK -> {
+            require(payload.size >= Int.SIZE_BYTES + 1) { "Packet acknowledgement is too short" }
+            val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            val sequence = buffer.int
+            require(sequence >= 0) { "Negative packet sequence" }
+            val success = buffer.get().toInt() != 0
+            val message = ByteArray(buffer.remaining()).also(buffer::get).decodeToString()
+            ControlMessage.PacketAck(sequence, success, message)
+        }
         else -> error("Unknown control frame type $type")
     }
 
     private const val TYPE_START: Byte = 1
     private const val TYPE_END: Byte = 2
     private const val TYPE_ACK: Byte = 3
+    private const val TYPE_DATA: Byte = 4
+    private const val TYPE_PACKET_ACK: Byte = 5
 }

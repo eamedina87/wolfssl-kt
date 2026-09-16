@@ -25,6 +25,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -37,6 +38,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import tech.medina.wolfssl_kt.transfer.FileTransferStrategy
 
 @Composable
 fun ClientScreen(viewModel: ClientViewModel) {
@@ -53,7 +55,9 @@ fun ClientScreen(viewModel: ClientViewModel) {
     val isTlsConnected by viewModel.isTlsConnected.collectAsState()
     val selectedFileDescription by viewModel.selectedFileDescription.collectAsState()
     val fileTransferStatus by viewModel.fileTransferStatus.collectAsState()
+    val fileTransferProgress by viewModel.fileTransferProgress.collectAsState()
     val fileTransferMetrics by viewModel.fileTransferMetrics.collectAsState()
+    val fileTransferStrategy by viewModel.fileTransferStrategy.collectAsState()
     val isFileTransferring by viewModel.isFileTransferring.collectAsState()
     val maximumBlePacketSize by viewModel.maximumBlePacketSize.collectAsState()
     var inputText by remember { mutableStateOf("") }
@@ -202,6 +206,36 @@ fun ClientScreen(viewModel: ClientViewModel) {
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
         )
+        FileTransferStrategy.entries.forEach { strategy ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = !isFileTransferring) {
+                        viewModel.selectFileTransferStrategy(strategy)
+                    },
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                RadioButton(
+                    selected = fileTransferStrategy == strategy,
+                    onClick = { viewModel.selectFileTransferStrategy(strategy) },
+                    enabled = !isFileTransferring,
+                )
+                Column {
+                    Text(strategy.displayName, style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        text = when (strategy) {
+                            FileTransferStrategy.VERIFIED_STREAM ->
+                                "Stream continuously; success after server SHA-256 verification."
+                            FileTransferStrategy.TX_ONLY ->
+                                "Client succeeds after BLE TX; server verification arrives afterward."
+                            FileTransferStrategy.STOP_AND_WAIT ->
+                                "Wait for a server application ACK after every file packet."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
         OutlinedButton(
             onClick = {
                 binaryFilePicker.launch(arrayOf("application/octet-stream", "application/x-binary"))
@@ -230,14 +264,20 @@ fun ClientScreen(viewModel: ClientViewModel) {
             text = "File transfer: $fileTransferStatus",
             style = MaterialTheme.typography.bodyMedium,
         )
+        Text(
+            text = fileTransferProgress,
+            style = MaterialTheme.typography.bodySmall,
+        )
         fileTransferMetrics?.let { metrics ->
             Text(
                 text = buildString {
+                    append("Strategy: ${metrics.strategy.displayName}\n")
                     append("Bytes: ${metrics.bytesTransferred}\n")
                     append("BLE packets sent: ${metrics.packetsSent}\n")
                     append("File TX time: ${metrics.transmitMillis} ms\n")
                     append("Total time: ${metrics.totalMillis} ms\n")
                     append("Server verification/round trip: ${metrics.verificationMillis} ms\n")
+                    append("Client success time: ${metrics.clientCompletionMillis} ms\n")
                     append("SHA-256: ${metrics.sha256}")
                 },
                 style = MaterialTheme.typography.bodySmall,

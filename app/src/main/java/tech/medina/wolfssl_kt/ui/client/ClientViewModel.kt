@@ -26,10 +26,12 @@ import tech.medina.wolfssl_kt.bluetooth.BluetoothLeClientConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
 import tech.medina.wolfssl_kt.transfer.FileTransferProtocol
+import tech.medina.wolfssl_kt.transfer.FileTransferStrategy
 import java.io.FileNotFoundException
 import java.security.MessageDigest
 
 data class FileTransferMetrics(
+    val strategy: FileTransferStrategy,
     val bytesTransferred: Long,
     val packetsSent: Long,
     val transmitMillis: Long,
@@ -38,6 +40,9 @@ data class FileTransferMetrics(
 ) {
     val verificationMillis: Long
         get() = (totalMillis - transmitMillis).coerceAtLeast(0)
+
+    val clientCompletionMillis: Long
+        get() = if (strategy == FileTransferStrategy.TX_ONLY) transmitMillis else totalMillis
 }
 
 private data class SelectedBinaryFile(
@@ -79,8 +84,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     val selectedFileDescription: StateFlow<String> = _selectedFileDescription.asStateFlow()
     private val _fileTransferStatus = MutableStateFlow("Idle")
     val fileTransferStatus: StateFlow<String> = _fileTransferStatus.asStateFlow()
+    private val _fileTransferProgress = MutableStateFlow("No transfer in progress")
+    val fileTransferProgress: StateFlow<String> = _fileTransferProgress.asStateFlow()
     private val _fileTransferMetrics = MutableStateFlow<FileTransferMetrics?>(null)
     val fileTransferMetrics: StateFlow<FileTransferMetrics?> = _fileTransferMetrics.asStateFlow()
+    private val _fileTransferStrategy = MutableStateFlow(FileTransferStrategy.VERIFIED_STREAM)
+    val fileTransferStrategy: StateFlow<FileTransferStrategy> = _fileTransferStrategy.asStateFlow()
     private val _isFileTransferring = MutableStateFlow(false)
     val isFileTransferring: StateFlow<Boolean> = _isFileTransferring.asStateFlow()
     val maximumBlePacketSize: StateFlow<Int> = clientManager.maximumWritePayloadSize
@@ -96,7 +105,13 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private var selectedBinaryFile: SelectedBinaryFile? = null
     private val fileAckLock = Any()
     private var pendingFileAck: CompletableDeferred<FileTransferProtocol.ControlMessage.Ack>? = null
+    private var pendingPacketAck: CompletableDeferred<FileTransferProtocol.ControlMessage.PacketAck>? = null
     private var fileAckBuffer = ByteArray(0)
+    private var progressInitialAcknowledgedPackets: Long? = null
+    private var progressInitialQueuedPackets = 0L
+    private var progressExpectedPackets: Long? = null
+    private var progressProcessedBytes = 0L
+    private var progressTotalBytes = 0L
 
     init {
         observeTlsState()
@@ -213,6 +228,13 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun selectFileTransferStrategy(strategy: FileTransferStrategy) {
+        if (!_isFileTransferring.value) {
+            _fileTransferStrategy.value = strategy
+            _fileTransferStatus.value = "${strategy.displayName} selected"
+        }
+    }
+
     fun sendSelectedFile() {
         val file = selectedBinaryFile
         if (file == null) {
@@ -228,26 +250,36 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         _isFileTransferring.value = true
         _fileTransferMetrics.value = null
         viewModelScope.launch(Dispatchers.IO) {
+            val strategy = _fileTransferStrategy.value
             val startedAt = SystemClock.elapsedRealtimeNanos()
             val initialPacketCount = clientManager.sentPacketCount()
+            val initialQueuedPacketCount = clientManager.queuedBlePacketCount()
             val firstEncryptedWrite = clientManager.lastQueuedEncryptedWrite()
             val digest = MessageDigest.getInstance("SHA-256")
             var bytesSent = 0L
+            var clientTxSucceeded = false
             val ack = CompletableDeferred<FileTransferProtocol.ControlMessage.Ack>()
             synchronized(fileAckLock) {
                 fileAckBuffer = ByteArray(0)
                 pendingFileAck = ack
             }
+            progressInitialAcknowledgedPackets = initialPacketCount
+            progressInitialQueuedPackets = initialQueuedPacketCount
+            progressExpectedPackets = null
+            progressProcessedBytes = 0
+            progressTotalBytes = file.size
+            updateFileTransferProgress()
             try {
                 val packetSize = maximumBlePacketSize.value
-                val chunkSize = FileTransferProtocol.fileChunkSize(packetSize)
-                _fileTransferStatus.value = "Starting transfer (${chunkSize}-byte file chunks)"
-                WolfSSLKt.send(FileTransferProtocol.encodeStart(file.name, file.size)).getOrThrow()
+                val chunkSize = FileTransferProtocol.fileChunkSize(packetSize, strategy)
+                _fileTransferStatus.value = "Starting ${strategy.displayName} (${chunkSize}-byte file chunks)"
+                WolfSSLKt.send(FileTransferProtocol.encodeStart(file.name, file.size, strategy)).getOrThrow()
 
                 val input = getApplication<Application>().contentResolver.openInputStream(file.uri)
                     ?: throw FileNotFoundException("Could not open ${file.name}")
                 input.use { stream ->
                     val buffer = ByteArray(chunkSize)
+                    var sequence = 0
                     while (bytesSent < file.size) {
                         val requested = minOf(buffer.size.toLong(), file.size - bytesSent).toInt()
                         val count = stream.read(buffer, 0, requested)
@@ -255,21 +287,61 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         if (count == 0) continue
                         val chunk = buffer.copyOf(count)
                         digest.update(chunk)
-                        WolfSSLKt.send(chunk).getOrThrow()
+                        if (strategy == FileTransferStrategy.STOP_AND_WAIT) {
+                            val packetAck = CompletableDeferred<FileTransferProtocol.ControlMessage.PacketAck>()
+                            synchronized(fileAckLock) {
+                                pendingPacketAck = packetAck
+                            }
+                            WolfSSLKt.send(FileTransferProtocol.encodeData(sequence, chunk)).getOrThrow()
+                            val response = withTimeout(PACKET_ACK_TIMEOUT_MS) { packetAck.await() }
+                            synchronized(fileAckLock) {
+                                if (pendingPacketAck === packetAck) pendingPacketAck = null
+                            }
+                            check(response.sequence == sequence) {
+                                "Expected ACK for packet $sequence but received ${response.sequence}"
+                            }
+                            check(response.success) {
+                                response.message.ifBlank { "Server rejected packet $sequence" }
+                            }
+                            sequence++
+                        } else {
+                            WolfSSLKt.send(chunk).getOrThrow()
+                        }
                         bytesSent += count
-                        _fileTransferStatus.value = "Sending ${formatBytes(bytesSent)} / ${formatBytes(file.size)}"
+                        progressProcessedBytes = bytesSent
+                        updateFileTransferProgress()
                     }
                 }
 
                 val sha256 = digest.digest()
                 WolfSSLKt.send(FileTransferProtocol.encodeEnd(sha256)).getOrThrow()
                 val lastEncryptedWrite = clientManager.lastQueuedEncryptedWrite()
+                progressExpectedPackets =
+                    clientManager.queuedBlePacketCount() - progressInitialQueuedPackets
+                updateFileTransferProgress()
+                if (strategy != FileTransferStrategy.STOP_AND_WAIT) {
+                    _fileTransferStatus.value = "TLS queue complete; waiting for BLE write acknowledgements"
+                }
                 withTimeout(FILE_ACK_TIMEOUT_MS) {
                     clientManager.awaitTransmittedThrough(firstEncryptedWrite, lastEncryptedWrite)
                 }
+                clientTxSucceeded = true
                 val transmitMillis = (SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000
                 val transmittedPackets = clientManager.sentPacketCount() - initialPacketCount
-                _fileTransferStatus.value = "Waiting for server verification"
+                updateFileTransferProgress(forceComplete = true)
+                if (strategy == FileTransferStrategy.TX_ONLY) {
+                    _fileTransferMetrics.value = FileTransferMetrics(
+                        strategy = strategy,
+                        bytesTransferred = bytesSent,
+                        packetsSent = transmittedPackets,
+                        transmitMillis = transmitMillis,
+                        totalMillis = transmitMillis,
+                        sha256 = FileTransferProtocol.sha256Hex(sha256),
+                    )
+                    _fileTransferStatus.value = "Client TX succeeded; waiting for server verification message"
+                } else {
+                    _fileTransferStatus.value = "TX complete; waiting for server verification"
+                }
                 val response = withTimeout(FILE_ACK_TIMEOUT_MS) { ack.await() }
                 check(response.success) { response.message.ifBlank { "Server rejected the file" } }
                 check(response.receivedBytes == bytesSent) {
@@ -279,6 +351,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
                 val totalMillis = (SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000
                 val metrics = FileTransferMetrics(
+                    strategy = strategy,
                     bytesTransferred = bytesSent,
                     packetsSent = transmittedPackets,
                     transmitMillis = transmitMillis,
@@ -286,16 +359,28 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                     sha256 = FileTransferProtocol.sha256Hex(sha256),
                 )
                 _fileTransferMetrics.value = metrics
-                _fileTransferStatus.value = "Transfer complete and verified by server"
+                _fileTransferStatus.value = if (strategy == FileTransferStrategy.TX_ONLY) {
+                    "Client TX succeeded. Server: ${response.message.ifBlank { "File transmission Ok" }}"
+                } else {
+                    "Transfer complete and verified by server"
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                _fileTransferStatus.value = "Transfer failed after ${formatBytes(bytesSent)}: ${error.message ?: "Unknown error"}"
+                _fileTransferStatus.value = if (
+                    strategy == FileTransferStrategy.TX_ONLY && clientTxSucceeded
+                ) {
+                    "Client TX succeeded; server verification failed: ${error.message ?: "Unknown error"}"
+                } else {
+                    "Transfer failed after ${formatBytes(bytesSent)}: ${error.message ?: "Unknown error"}"
+                }
             } finally {
                 synchronized(fileAckLock) {
                     if (pendingFileAck === ack) pendingFileAck = null
+                    pendingPacketAck = null
                     fileAckBuffer = ByteArray(0)
                 }
+                progressInitialAcknowledgedPackets = null
                 _isFileTransferring.value = false
             }
         }
@@ -317,6 +402,8 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         synchronized(fileAckLock) {
             pendingFileAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
             pendingFileAck = null
+            pendingPacketAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
+            pendingPacketAck = null
             fileAckBuffer = ByteArray(0)
         }
         tlsReadJob?.cancel()
@@ -428,6 +515,8 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         synchronized(fileAckLock) {
                             pendingFileAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
                             pendingFileAck = null
+                            pendingPacketAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
+                            pendingPacketAck = null
                             fileAckBuffer = ByteArray(0)
                         }
                     }
@@ -442,7 +531,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         }
                     }
                     BleClientConnectionEvent.InputCharacteristicWriteSuccess -> {
-                        if (!_isFileTransferring.value) {
+                        if (_isFileTransferring.value) {
+                            updateFileTransferProgress()
+                        } else {
                             _clientWriteStatus.value = "Input characteristic write success"
                         }
                     }
@@ -526,23 +617,30 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private fun handleFileAckData(data: ByteArray) {
         synchronized(fileAckLock) {
             fileAckBuffer += data
-            when (val decoded = FileTransferProtocol.decode(fileAckBuffer)) {
+            while (fileAckBuffer.isNotEmpty()) when (val decoded = FileTransferProtocol.decode(fileAckBuffer)) {
                 is FileTransferProtocol.DecodeResult.Decoded -> {
-                    val response = decoded.message as? FileTransferProtocol.ControlMessage.Ack
-                    if (response == null) {
-                        pendingFileAck?.completeExceptionally(IllegalStateException("Unexpected server control message"))
-                    } else {
-                        fileAckBuffer = fileAckBuffer.copyOfRange(decoded.consumedBytes, fileAckBuffer.size)
-                        pendingFileAck?.complete(response)
+                    fileAckBuffer = fileAckBuffer.copyOfRange(decoded.consumedBytes, fileAckBuffer.size)
+                    when (val message = decoded.message) {
+                        is FileTransferProtocol.ControlMessage.Ack -> pendingFileAck?.complete(message)
+                        is FileTransferProtocol.ControlMessage.PacketAck -> pendingPacketAck?.complete(message)
+                        else -> {
+                            val error = IllegalStateException("Unexpected server control message")
+                            pendingFileAck?.completeExceptionally(error)
+                            pendingPacketAck?.completeExceptionally(error)
+                        }
                     }
                 }
                 is FileTransferProtocol.DecodeResult.Invalid -> {
                     pendingFileAck?.completeExceptionally(IllegalStateException(decoded.reason))
+                    pendingPacketAck?.completeExceptionally(IllegalStateException(decoded.reason))
+                    return
                 }
                 FileTransferProtocol.DecodeResult.NotAControlFrame -> {
                     pendingFileAck?.completeExceptionally(IllegalStateException("Server returned an invalid transfer acknowledgement"))
+                    pendingPacketAck?.completeExceptionally(IllegalStateException("Server returned an invalid packet acknowledgement"))
+                    return
                 }
-                FileTransferProtocol.DecodeResult.NeedMoreData -> Unit
+                FileTransferProtocol.DecodeResult.NeedMoreData -> return
             }
         }
     }
@@ -553,8 +651,30 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         else -> "$bytes B"
     }
 
+    private fun updateFileTransferProgress(forceComplete: Boolean = false) {
+        val initialPackets = progressInitialAcknowledgedPackets ?: return
+        val acknowledged = if (forceComplete) {
+            progressExpectedPackets ?: (clientManager.sentPacketCount() - initialPackets)
+        } else {
+            (clientManager.sentPacketCount() - initialPackets).coerceAtLeast(0)
+        }
+        val expected = progressExpectedPackets
+        val percentage = if (progressTotalBytes == 0L) {
+            100
+        } else {
+            ((progressProcessedBytes * 100) / progressTotalBytes).coerceIn(0, 100)
+        }
+        _fileTransferProgress.value = buildString {
+            append("Processing/queueing: ${formatBytes(progressProcessedBytes)} / ")
+            append("${formatBytes(progressTotalBytes)} ($percentage%)\n")
+            append("BLE packets acknowledged: $acknowledged")
+            if (expected != null) append(" / $expected") else append(" (total still being queued)")
+        }
+    }
+
     private companion object {
         // GATT writes use acknowledgements and can take minutes for multi-megabyte files.
         const val FILE_ACK_TIMEOUT_MS = 10 * 60_000L
+        const val PACKET_ACK_TIMEOUT_MS = 30_000L
     }
 }

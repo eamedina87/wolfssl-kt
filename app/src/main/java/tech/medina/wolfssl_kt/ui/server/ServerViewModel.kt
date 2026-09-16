@@ -18,17 +18,20 @@ import tech.medina.wolfssl_kt.bluetooth.BluetoothLeServerConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
 import tech.medina.wolfssl_kt.transfer.FileTransferProtocol
+import tech.medina.wolfssl_kt.transfer.FileTransferStrategy
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
 
 private data class IncomingFileTransfer(
+    val strategy: FileTransferStrategy,
     val expectedBytes: Long,
     val finalFile: File,
     val partialFile: File,
     val output: FileOutputStream,
     val digest: MessageDigest,
     var receivedBytes: Long = 0,
+    var expectedSequence: Int = 0,
 )
 
 class ServerViewModel(application: Application) : AndroidViewModel(application) {
@@ -55,6 +58,8 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     val serverWriteStatus: StateFlow<String> = _serverWriteStatus.asStateFlow()
     private val _receivedFileStatus = MutableStateFlow("No file received")
     val receivedFileStatus: StateFlow<String> = _receivedFileStatus.asStateFlow()
+    private val _receivedFileStrategy = MutableStateFlow("Waiting for client selection")
+    val receivedFileStrategy: StateFlow<String> = _receivedFileStrategy.asStateFlow()
     private val _tlsStatus = MutableStateFlow("TLS idle")
     val tlsStatus: StateFlow<String> = _tlsStatus.asStateFlow()
     private val _isTlsConnected = MutableStateFlow(false)
@@ -280,7 +285,11 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         incomingPlaintextBuffer += data
         while (incomingPlaintextBuffer.isNotEmpty()) {
             val transfer = incomingFileTransfer
-            if (transfer != null && transfer.receivedBytes < transfer.expectedBytes) {
+            if (
+                transfer != null &&
+                transfer.strategy != FileTransferStrategy.STOP_AND_WAIT &&
+                transfer.receivedBytes < transfer.expectedBytes
+            ) {
                 val count = minOf(
                     incomingPlaintextBuffer.size.toLong(),
                     transfer.expectedBytes - transfer.receivedBytes,
@@ -327,9 +336,13 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
                     )
                     when (val message = decoded.message) {
                         is FileTransferProtocol.ControlMessage.Start -> startIncomingFile(message)
+                        is FileTransferProtocol.ControlMessage.Data -> receiveDataPacket(message)
                         is FileTransferProtocol.ControlMessage.End -> finishIncomingFile(message.sha256)
                         is FileTransferProtocol.ControlMessage.Ack -> {
                             _serverInputCharacteristicValue.value = "Unexpected file acknowledgement"
+                        }
+                        is FileTransferProtocol.ControlMessage.PacketAck -> {
+                            _serverInputCharacteristicValue.value = "Unexpected packet acknowledgement"
                         }
                     }
                 }
@@ -348,6 +361,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
             val finalFile = uniqueDestination(directory, safeName)
             val partialFile = File(directory, "${finalFile.name}.part")
             IncomingFileTransfer(
+                strategy = start.strategy,
                 expectedBytes = start.fileSize,
                 finalFile = finalFile,
                 partialFile = partialFile,
@@ -357,12 +371,51 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         }.fold(
             onSuccess = { transfer ->
                 incomingFileTransfer = transfer
+                _receivedFileStrategy.value = transfer.strategy.displayName
                 _receivedFileStatus.value =
-                    "Receiving ${transfer.finalFile.name} (0 B / ${formatBytes(transfer.expectedBytes)})"
+                    "Receiving ${transfer.finalFile.name} with ${transfer.strategy.displayName} (0 B / ${formatBytes(transfer.expectedBytes)})"
             },
             onFailure = { error ->
                 _receivedFileStatus.value = "Could not start file receive: ${error.message ?: "Unknown error"}"
                 sendFileAck(false, 0, ByteArray(FileTransferProtocol.DIGEST_SIZE), _receivedFileStatus.value)
+            },
+        )
+    }
+
+    private fun receiveDataPacket(data: FileTransferProtocol.ControlMessage.Data) {
+        val transfer = incomingFileTransfer
+        if (transfer == null || transfer.strategy != FileTransferStrategy.STOP_AND_WAIT) {
+            sendPacketAck(data.sequence, false, "Data packet is not expected for this strategy")
+            return
+        }
+        if (data.sequence != transfer.expectedSequence) {
+            val message = "Expected packet ${transfer.expectedSequence} but received ${data.sequence}"
+            sendPacketAck(data.sequence, false, message)
+            failIncomingFile(message)
+            return
+        }
+        val remaining = transfer.expectedBytes - transfer.receivedBytes
+        if (data.bytes.isEmpty() || data.bytes.size.toLong() > remaining) {
+            val message = "Packet ${data.sequence} has an invalid payload size"
+            sendPacketAck(data.sequence, false, message)
+            failIncomingFile(message)
+            return
+        }
+        runCatching {
+            transfer.output.write(data.bytes)
+            transfer.digest.update(data.bytes)
+            transfer.receivedBytes += data.bytes.size
+            transfer.expectedSequence++
+        }.fold(
+            onSuccess = {
+                _receivedFileStatus.value =
+                    "Receiving ${transfer.finalFile.name}: ${formatBytes(transfer.receivedBytes)} / ${formatBytes(transfer.expectedBytes)}"
+                sendPacketAck(data.sequence, true)
+            },
+            onFailure = { error ->
+                val message = "Could not write packet ${data.sequence}: ${error.message ?: "Unknown error"}"
+                sendPacketAck(data.sequence, false, message)
+                failIncomingFile(message)
             },
         )
     }
@@ -388,7 +441,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         if (success.isSuccess) {
             _receivedFileStatus.value =
                 "Received ${transfer.finalFile.name}: ${formatBytes(transfer.receivedBytes)}, SHA-256 ${FileTransferProtocol.sha256Hex(actualDigest)}\n${transfer.finalFile.absolutePath}"
-            sendFileAck(true, transfer.receivedBytes, actualDigest, "File received and verified")
+            sendFileAck(true, transfer.receivedBytes, actualDigest, "File transmission Ok")
         } else {
             transfer.partialFile.delete()
             val message = success.exceptionOrNull()?.message ?: "Could not finalize received file"
@@ -425,6 +478,13 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
         WolfSSLKt.send(FileTransferProtocol.encodeAck(success, receivedBytes, digest, message))
             .onFailure { error ->
                 _serverWriteStatus.value = "Could not send file acknowledgement: ${error.message ?: "Unknown error"}"
+            }
+    }
+
+    private fun sendPacketAck(sequence: Int, success: Boolean, message: String = "") {
+        WolfSSLKt.send(FileTransferProtocol.encodePacketAck(sequence, success, message))
+            .onFailure { error ->
+                _serverWriteStatus.value = "Could not send ACK for packet $sequence: ${error.message ?: "Unknown error"}"
             }
     }
 

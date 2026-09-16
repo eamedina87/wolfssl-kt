@@ -19,6 +19,7 @@ import android.bluetooth.le.ScanCallback.SCAN_FAILED_ALREADY_STARTED
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.CoroutineScope
@@ -94,25 +95,43 @@ class BluetoothLeClientConnectionManager(
     private var pendingMtuAck: CompletableDeferred<Pair<Int, Int>>? = null
     private val successfulPacketWrites = AtomicLong(0)
     private val queuedEncryptedWrites = AtomicLong(0)
+    private val queuedBlePackets = AtomicLong(0)
     private val processedEncryptedWrites = AtomicLong(0)
     private val lastFailedEncryptedWrite = AtomicLong(NO_FAILED_WRITE)
     private val _processedEncryptedWriteCount = MutableStateFlow(0L)
+    private val encryptedWriteTimingLock = Any()
+    private val encryptedWriteTimings = linkedMapOf<Long, EncryptedWriteTiming>()
 
     fun sentPacketCount(): Long = successfulPacketWrites.get()
 
-    fun onEncryptedDataQueued() {
+    fun onEncryptedDataQueued(encryptedSize: Int) {
         queuedEncryptedWrites.incrementAndGet()
+        val packetSize = _maximumWritePayloadSize.value
+        val packetCount = if (encryptedSize == 0) 1 else (encryptedSize + packetSize - 1) / packetSize
+        queuedBlePackets.addAndGet(packetCount.toLong())
     }
 
     fun lastQueuedEncryptedWrite(): Long = queuedEncryptedWrites.get()
 
-    suspend fun awaitTransmittedThrough(firstSequence: Long, lastSequence: Long) {
+    fun queuedBlePacketCount(): Long = queuedBlePackets.get()
+
+    suspend fun awaitTransmittedThrough(firstSequence: Long, lastSequence: Long): Long {
+        if (lastSequence <= firstSequence) return 0L
         if (_processedEncryptedWriteCount.value < lastSequence) {
             _processedEncryptedWriteCount.first { it >= lastSequence }
         }
         val failedSequence = lastFailedEncryptedWrite.get()
         check(failedSequence !in (firstSequence + 1)..lastSequence) {
             "A BLE write failed before the file transmission completed"
+        }
+        return synchronized(encryptedWriteTimingLock) {
+            val first = encryptedWriteTimings[firstSequence + 1]
+                ?: error("Missing timing for the first BLE write")
+            val last = encryptedWriteTimings[lastSequence]
+                ?: error("Missing timing for the final BLE write")
+            val elapsedMillis = (last.completedAtNanos - first.startedAtNanos) / 1_000_000
+            encryptedWriteTimings.keys.removeAll { it <= lastSequence }
+            elapsedMillis.coerceAtLeast(0)
         }
     }
 
@@ -191,8 +210,17 @@ class BluetoothLeClientConnectionManager(
         outgoingWriteJob?.cancel()
         outgoingWriteJob = scope.launch {
             for (data in bluetoothProvider.outgoingChannel) {
+                val sequence = processedEncryptedWrites.get() + 1
+                val startedAtNanos = SystemClock.elapsedRealtimeNanos()
                 val success = writeToServerCharacteristic(data)
-                val sequence = processedEncryptedWrites.incrementAndGet()
+                val completedAtNanos = SystemClock.elapsedRealtimeNanos()
+                processedEncryptedWrites.incrementAndGet()
+                synchronized(encryptedWriteTimingLock) {
+                    encryptedWriteTimings[sequence] = EncryptedWriteTiming(
+                        startedAtNanos = startedAtNanos,
+                        completedAtNanos = completedAtNanos,
+                    )
+                }
                 if (!success) lastFailedEncryptedWrite.set(sequence)
                 _processedEncryptedWriteCount.value = sequence
             }
@@ -572,6 +600,11 @@ class BluetoothLeClientConnectionManager(
     }
 
     private companion object {
+        data class EncryptedWriteTiming(
+            val startedAtNanos: Long,
+            val completedAtNanos: Long,
+        )
+
         const val TAG = "BleClientConnectionManager"
         const val ENABLE_SCAN_DIAGNOSTICS = true
         const val GATT_OPERATION_TIMEOUT_MS = 5_000L
