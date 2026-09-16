@@ -2,20 +2,49 @@ package tech.medina.wolfssl_kt.ui.client
 
 import android.Manifest
 import android.app.Application
+import android.net.Uri
+import android.os.SystemClock
+import android.provider.OpenableColumns
 import androidx.annotation.RequiresPermission
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import tech.medina.wolfssl.kt.PKIData
 import tech.medina.wolfssl.kt.WolfSSLKt
+import tech.medina.wolfssl.kt.WolfSSLKtSendCallback
 import tech.medina.wolfssl_kt.bluetooth.BleClientConnectionEvent
 import tech.medina.wolfssl_kt.bluetooth.BluetoothLeClientConnectionManager
 import tech.medina.wolfssl_kt.bluetooth.GattBluetoothProvider
 import tech.medina.wolfssl_kt.tls.TlsMaterialProvider
+import tech.medina.wolfssl_kt.transfer.FileTransferProtocol
+import java.io.FileNotFoundException
+import java.security.MessageDigest
+
+data class FileTransferMetrics(
+    val bytesTransferred: Long,
+    val packetsSent: Long,
+    val transmitMillis: Long,
+    val totalMillis: Long,
+    val sha256: String,
+) {
+    val verificationMillis: Long
+        get() = (totalMillis - transmitMillis).coerceAtLeast(0)
+}
+
+private data class SelectedBinaryFile(
+    val uri: Uri,
+    val name: String,
+    val size: Long,
+)
 
 class ClientViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -23,6 +52,8 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private val clientManager = BluetoothLeClientConnectionManager(application, bluetoothProvider)
 
     private val serverAddressByLabel = linkedMapOf<String, String>()
+    private val sessionTicketByServerAddress = mutableMapOf<String, ByteArray>()
+    private var connectedServerAddress: String? = null
 
     private val _connectionState = MutableStateFlow("Idle")
     val connectionState: StateFlow<String> = _connectionState.asStateFlow()
@@ -44,6 +75,15 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _clientWriteStatus = MutableStateFlow("Idle")
     val clientWriteStatus: StateFlow<String> = _clientWriteStatus.asStateFlow()
+    private val _selectedFileDescription = MutableStateFlow("No binary file selected")
+    val selectedFileDescription: StateFlow<String> = _selectedFileDescription.asStateFlow()
+    private val _fileTransferStatus = MutableStateFlow("Idle")
+    val fileTransferStatus: StateFlow<String> = _fileTransferStatus.asStateFlow()
+    private val _fileTransferMetrics = MutableStateFlow<FileTransferMetrics?>(null)
+    val fileTransferMetrics: StateFlow<FileTransferMetrics?> = _fileTransferMetrics.asStateFlow()
+    private val _isFileTransferring = MutableStateFlow(false)
+    val isFileTransferring: StateFlow<Boolean> = _isFileTransferring.asStateFlow()
+    val maximumBlePacketSize: StateFlow<Int> = clientManager.maximumWritePayloadSize
     private val _hasActiveConnection = MutableStateFlow(false)
     val hasActiveConnection: StateFlow<Boolean> = _hasActiveConnection.asStateFlow()
     private val _tlsStatus = MutableStateFlow("TLS idle")
@@ -53,8 +93,13 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private var isTlsPrepared = false
     private var isTlsLaunching = false
     private var tlsReadJob: Job? = null
+    private var selectedBinaryFile: SelectedBinaryFile? = null
+    private val fileAckLock = Any()
+    private var pendingFileAck: CompletableDeferred<FileTransferProtocol.ControlMessage.Ack>? = null
+    private var fileAckBuffer = ByteArray(0)
 
     init {
+        observeTlsState()
         observeDiscoveredDevices()
         observeClientEvents()
     }
@@ -121,6 +166,141 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun selectBinaryFile(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val resolver = getApplication<Application>().contentResolver
+                val metadata = resolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    if (!cursor.moveToFirst()) return@use null
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    val name = if (nameIndex >= 0) cursor.getString(nameIndex) else null
+                    val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else null
+                    name to size
+                }
+                val name = metadata?.first?.takeIf(String::isNotBlank)
+                    ?: uri.lastPathSegment?.substringAfterLast('/')
+                    ?: "transfer.bin"
+                val size = metadata?.second?.takeIf { it >= 0 }
+                    ?: resolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+                    ?: -1L
+                val mimeType = resolver.getType(uri)
+                require(mimeType?.startsWith("text/") != true) { "Please select a binary file" }
+                require(size >= 0L) { "The selected provider did not report the file size" }
+                runCatching {
+                    resolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                SelectedBinaryFile(uri, name, size)
+            }.fold(
+                onSuccess = { file ->
+                    selectedBinaryFile = file
+                    _selectedFileDescription.value = "${file.name} (${formatBytes(file.size)})"
+                    _fileTransferStatus.value = "Ready to transfer"
+                    _fileTransferMetrics.value = null
+                },
+                onFailure = { error ->
+                    selectedBinaryFile = null
+                    _selectedFileDescription.value = "No binary file selected"
+                    _fileTransferStatus.value = "File selection failed: ${error.message ?: "Unknown error"}"
+                },
+            )
+        }
+    }
+
+    fun sendSelectedFile() {
+        val file = selectedBinaryFile
+        if (file == null) {
+            _fileTransferStatus.value = "Select a binary file first"
+            return
+        }
+        if (!_isTlsConnected.value) {
+            _fileTransferStatus.value = "TLS is not connected"
+            return
+        }
+        if (_isFileTransferring.value) return
+
+        _isFileTransferring.value = true
+        _fileTransferMetrics.value = null
+        viewModelScope.launch(Dispatchers.IO) {
+            val startedAt = SystemClock.elapsedRealtimeNanos()
+            val initialPacketCount = clientManager.sentPacketCount()
+            val firstEncryptedWrite = clientManager.lastQueuedEncryptedWrite()
+            val digest = MessageDigest.getInstance("SHA-256")
+            var bytesSent = 0L
+            val ack = CompletableDeferred<FileTransferProtocol.ControlMessage.Ack>()
+            synchronized(fileAckLock) {
+                fileAckBuffer = ByteArray(0)
+                pendingFileAck = ack
+            }
+            try {
+                val packetSize = maximumBlePacketSize.value
+                val chunkSize = FileTransferProtocol.fileChunkSize(packetSize)
+                _fileTransferStatus.value = "Starting transfer (${chunkSize}-byte file chunks)"
+                WolfSSLKt.send(FileTransferProtocol.encodeStart(file.name, file.size)).getOrThrow()
+
+                val input = getApplication<Application>().contentResolver.openInputStream(file.uri)
+                    ?: throw FileNotFoundException("Could not open ${file.name}")
+                input.use { stream ->
+                    val buffer = ByteArray(chunkSize)
+                    while (bytesSent < file.size) {
+                        val requested = minOf(buffer.size.toLong(), file.size - bytesSent).toInt()
+                        val count = stream.read(buffer, 0, requested)
+                        if (count < 0) throw IllegalStateException("File ended after $bytesSent of ${file.size} bytes")
+                        if (count == 0) continue
+                        val chunk = buffer.copyOf(count)
+                        digest.update(chunk)
+                        WolfSSLKt.send(chunk).getOrThrow()
+                        bytesSent += count
+                        _fileTransferStatus.value = "Sending ${formatBytes(bytesSent)} / ${formatBytes(file.size)}"
+                    }
+                }
+
+                val sha256 = digest.digest()
+                WolfSSLKt.send(FileTransferProtocol.encodeEnd(sha256)).getOrThrow()
+                val lastEncryptedWrite = clientManager.lastQueuedEncryptedWrite()
+                withTimeout(FILE_ACK_TIMEOUT_MS) {
+                    clientManager.awaitTransmittedThrough(firstEncryptedWrite, lastEncryptedWrite)
+                }
+                val transmitMillis = (SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000
+                val transmittedPackets = clientManager.sentPacketCount() - initialPacketCount
+                _fileTransferStatus.value = "Waiting for server verification"
+                val response = withTimeout(FILE_ACK_TIMEOUT_MS) { ack.await() }
+                check(response.success) { response.message.ifBlank { "Server rejected the file" } }
+                check(response.receivedBytes == bytesSent) {
+                    "Server received ${response.receivedBytes} of $bytesSent bytes"
+                }
+                check(response.sha256.contentEquals(sha256)) { "Server digest does not match the client digest" }
+
+                val totalMillis = (SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000
+                val metrics = FileTransferMetrics(
+                    bytesTransferred = bytesSent,
+                    packetsSent = transmittedPackets,
+                    transmitMillis = transmitMillis,
+                    totalMillis = totalMillis,
+                    sha256 = FileTransferProtocol.sha256Hex(sha256),
+                )
+                _fileTransferMetrics.value = metrics
+                _fileTransferStatus.value = "Transfer complete and verified by server"
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                _fileTransferStatus.value = "Transfer failed after ${formatBytes(bytesSent)}: ${error.message ?: "Unknown error"}"
+            } finally {
+                synchronized(fileAckLock) {
+                    if (pendingFileAck === ack) pendingFileAck = null
+                    fileAckBuffer = ByteArray(0)
+                }
+                _isFileTransferring.value = false
+            }
+        }
+    }
+
     fun disconnect() {
         viewModelScope.launch(Dispatchers.IO) {
             WolfSSLKt.release()
@@ -134,6 +314,11 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         isTlsLaunching = false
         _tlsStatus.value = "TLS idle"
         _isTlsConnected.value = false
+        synchronized(fileAckLock) {
+            pendingFileAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
+            pendingFileAck = null
+            fileAckBuffer = ByteArray(0)
+        }
         tlsReadJob?.cancel()
         tlsReadJob = null
     }
@@ -195,6 +380,17 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    private fun observeTlsState() {
+        viewModelScope.launch {
+            WolfSSLKt.state.collectLatest { state ->
+                if (state is WolfSSLKt.WolfSSLKtState.TlsConnected) {
+                    val address = connectedServerAddress ?: return@collectLatest
+                    sessionTicketByServerAddress[address] = state.sessionTicket.copyOf()
+                }
+            }
+        }
+    }
+
     private fun observeClientEvents() {
         viewModelScope.launch {
             clientManager.events.collect { event ->
@@ -211,11 +407,15 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         _clientConnectionStatus.value = "Found ${event.device.address}"
                     }
                     is BleClientConnectionEvent.Connected -> {
+                        connectedServerAddress = event.address
                         _clientConnectionStatus.value = "Connected to ${event.address}"
                         _connectionState.value = "Client connected"
                         _hasActiveConnection.value = true
                     }
                     is BleClientConnectionEvent.Disconnected -> {
+                        if (connectedServerAddress == event.address) {
+                            connectedServerAddress = null
+                        }
                         _clientConnectionStatus.value = "Disconnected from ${event.address}"
                         _connectionState.value = "Client disconnected"
                         _hasActiveConnection.value = false
@@ -225,6 +425,11 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         _isTlsConnected.value = false
                         tlsReadJob?.cancel()
                         tlsReadJob = null
+                        synchronized(fileAckLock) {
+                            pendingFileAck?.completeExceptionally(IllegalStateException("Disconnected during file transfer"))
+                            pendingFileAck = null
+                            fileAckBuffer = ByteArray(0)
+                        }
                     }
                     is BleClientConnectionEvent.ServicesReady -> {
                         _clientConnectionStatus.value = "Services ready on ${event.address}"
@@ -237,7 +442,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                         }
                     }
                     BleClientConnectionEvent.InputCharacteristicWriteSuccess -> {
-                        _clientWriteStatus.value = "Input characteristic write success"
+                        if (!_isFileTransferring.value) {
+                            _clientWriteStatus.value = "Input characteristic write success"
+                        }
                     }
                     is BleClientConnectionEvent.CharacteristicWriteFailed -> {
                         _clientWriteStatus.value = "Input characteristic write failed (status=${event.status})"
@@ -262,6 +469,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun prepareTlsConnection() {
         val appContext = getApplication<Application>()
+        val serverAddress = connectedServerAddress ?: _selectedServer.value?.let { selected ->
+            serverAddressByLabel[selected] ?: selected
+        }
         val materialsResult = TlsMaterialProvider.loadForRole(
             appContext,
             TlsMaterialProvider.EndpointRole.CLIENT
@@ -274,14 +484,23 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         }
         WolfSSLKt.clear()
         val materials = materialsResult.getOrThrow()
+        val receiveCallback = WolfSSLKt.createReceiveCallback(bluetoothProvider.incomingChannel)
         val prepareResult = WolfSSLKt.prepareTls13Connection(
             cipher = WolfSSLKt.SupportedCipher.TLS_CHACHA20_POLY1305_SHA256,
             mode = WolfSSLKt.TlsMode.CLIENT,
-            pemPrivateKey = materials.privateKey,
-            caCertificate = materials.caCertificate,
-            certificateChain = materials.certificateChain,
-            incomingEncryptedDataChannel = bluetoothProvider.incomingChannel,
-            outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel
+            pkiData = PKIData(
+                caCertificate = materials.caCertificate,
+                certificateChain = materials.certificateChain,
+                pemPrivateKey = materials.privateKey,
+            ),
+            receiveCallback = receiveCallback,
+            sendCallback = WolfSSLKtSendCallback(
+                outgoingEncryptedDataChannel = bluetoothProvider.outgoingChannel,
+                onEncryptedDataQueued = clientManager::onEncryptedDataQueued,
+            ),
+            previousSessionTicket = serverAddress
+                ?.let(sessionTicketByServerAddress::get)
+                ?.copyOf()
         )
         isTlsPrepared = prepareResult.isSuccess
         _isTlsConnected.value = false
@@ -295,8 +514,47 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         tlsReadJob?.cancel()
         tlsReadJob = viewModelScope.launch(Dispatchers.IO) {
             WolfSSLKt.read(delay = 50).collect { data ->
-                _clientOutputCharacteristicValue.value = toDisplay(data)
+                if (synchronized(fileAckLock) { pendingFileAck != null }) {
+                    handleFileAckData(data)
+                } else {
+                    _clientOutputCharacteristicValue.value = toDisplay(data)
+                }
             }
         }
+    }
+
+    private fun handleFileAckData(data: ByteArray) {
+        synchronized(fileAckLock) {
+            fileAckBuffer += data
+            when (val decoded = FileTransferProtocol.decode(fileAckBuffer)) {
+                is FileTransferProtocol.DecodeResult.Decoded -> {
+                    val response = decoded.message as? FileTransferProtocol.ControlMessage.Ack
+                    if (response == null) {
+                        pendingFileAck?.completeExceptionally(IllegalStateException("Unexpected server control message"))
+                    } else {
+                        fileAckBuffer = fileAckBuffer.copyOfRange(decoded.consumedBytes, fileAckBuffer.size)
+                        pendingFileAck?.complete(response)
+                    }
+                }
+                is FileTransferProtocol.DecodeResult.Invalid -> {
+                    pendingFileAck?.completeExceptionally(IllegalStateException(decoded.reason))
+                }
+                FileTransferProtocol.DecodeResult.NotAControlFrame -> {
+                    pendingFileAck?.completeExceptionally(IllegalStateException("Server returned an invalid transfer acknowledgement"))
+                }
+                FileTransferProtocol.DecodeResult.NeedMoreData -> Unit
+            }
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024 * 1024 -> "%.2f MiB".format(bytes / (1024.0 * 1024.0))
+        bytes >= 1024 -> "%.2f KiB".format(bytes / 1024.0)
+        else -> "$bytes B"
+    }
+
+    private companion object {
+        // GATT writes use acknowledgements and can take minutes for multi-megabyte files.
+        const val FILE_ACK_TIMEOUT_MS = 10 * 60_000L
     }
 }

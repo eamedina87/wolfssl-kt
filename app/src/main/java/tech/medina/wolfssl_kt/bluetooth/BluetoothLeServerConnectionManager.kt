@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -64,6 +65,7 @@ class BluetoothLeServerConnectionManager(
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private val connectedDevices = LinkedHashSet<BluetoothDevice>()
     private val subscribedDevices = LinkedHashSet<BluetoothDevice>()
+    private val packetSizeByAddress = mutableMapOf<String, Int>()
     private var outgoingNotifyJob: Job? = null
     private var isAdvertising = false
     private val notifyMutex = Mutex()
@@ -106,6 +108,7 @@ class BluetoothLeServerConnectionManager(
         outgoingNotifyJob = null
         connectedDevices.clear()
         subscribedDevices.clear()
+        packetSizeByAddress.clear()
         notifyCharacteristic = null
         gattServer?.close()
         gattServer = null
@@ -207,11 +210,12 @@ class BluetoothLeServerConnectionManager(
     @SuppressLint("MissingPermission")
     private suspend fun notifyConnectedDevices(data: ByteArray) {
         notifyMutex.withLock {
-            for (packet in BleTransport.chunk(data)) {
-                val device = waitForSubscribedDevice() ?: run {
-                    emitEvent(BleServerConnectionEvent.Error("No subscribed client available for output characteristic write"))
-                    return
-                }
+            val device = waitForSubscribedDevice() ?: run {
+                emitEvent(BleServerConnectionEvent.Error("No subscribed client available for output characteristic write"))
+                return
+            }
+            val packetSize = packetSizeByAddress[device.address] ?: BleTransport.DEFAULT_PACKET_SIZE
+            for (packet in BleTransport.chunk(data, packetSize)) {
                 val server = gattServer ?: return
                 val characteristic = notifyCharacteristic ?: return
                 val ack = CompletableDeferred<Int>()
@@ -220,7 +224,7 @@ class BluetoothLeServerConnectionManager(
                 }
 
                 val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    server.notifyCharacteristicChanged(device, characteristic, true, packet) == BluetoothGatt.GATT_SUCCESS
+                    server.notifyCharacteristicChanged(device, characteristic, true, packet) == BluetoothStatusCodes.SUCCESS
                 } else {
                     @Suppress("DEPRECATION")
                     run {
@@ -293,14 +297,20 @@ class BluetoothLeServerConnectionManager(
                         stopAdvertising()
                     }
                     connectedDevices += device
+                    packetSizeByAddress[device.address] = BleTransport.DEFAULT_PACKET_SIZE
                     emitEvent(BleServerConnectionEvent.DeviceConnected(device.address))
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectedDevices -= device
                     subscribedDevices -= device
+                    packetSizeByAddress.remove(device.address)
                     emitEvent(BleServerConnectionEvent.DeviceDisconnected(device.address))
                 }
             }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            packetSizeByAddress[device.address] = BleTransport.packetSizeForMtu(mtu)
         }
 
         @SuppressLint("MissingPermission")

@@ -41,6 +41,7 @@ fun ServerScreen(viewModel: ServerViewModel) {
     val writeStatus by viewModel.serverWriteStatus.collectAsState()
     val tlsStatus by viewModel.tlsStatus.collectAsState()
     val isTlsConnected by viewModel.isTlsConnected.collectAsState()
+    val receivedFileStatus by viewModel.receivedFileStatus.collectAsState()
     var outputText by remember { mutableStateOf("") }
     val advertisePermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -143,6 +144,10 @@ fun ServerScreen(viewModel: ServerViewModel) {
         Text(
             text = "Latest TLS payload: $latestInputValue",
             style = MaterialTheme.typography.bodyMedium
+        )
+        Text(
+            text = "File receive: $receivedFileStatus",
+            style = MaterialTheme.typography.bodyMedium,
         )
         Text(
             text = "Connection state: $transportState",

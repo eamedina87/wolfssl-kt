@@ -51,7 +51,17 @@ fun ClientScreen(viewModel: ClientViewModel) {
     val hasActiveConnection by viewModel.hasActiveConnection.collectAsState()
     val tlsStatus by viewModel.tlsStatus.collectAsState()
     val isTlsConnected by viewModel.isTlsConnected.collectAsState()
+    val selectedFileDescription by viewModel.selectedFileDescription.collectAsState()
+    val fileTransferStatus by viewModel.fileTransferStatus.collectAsState()
+    val fileTransferMetrics by viewModel.fileTransferMetrics.collectAsState()
+    val isFileTransferring by viewModel.isFileTransferring.collectAsState()
+    val maximumBlePacketSize by viewModel.maximumBlePacketSize.collectAsState()
     var inputText by remember { mutableStateOf("") }
+    val binaryFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) viewModel.selectBinaryFile(uri)
+    }
     val scanPermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(
@@ -187,6 +197,52 @@ fun ClientScreen(viewModel: ClientViewModel) {
             text = "TLS state: $tlsStatus",
             style = MaterialTheme.typography.bodyMedium
         )
+        Text(
+            text = "Binary file transfer",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        OutlinedButton(
+            onClick = {
+                binaryFilePicker.launch(arrayOf("application/octet-stream", "application/x-binary"))
+            },
+            enabled = !isFileTransferring,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Select binary file")
+        }
+        Text(
+            text = "Selected file: $selectedFileDescription",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            text = "BLE packet payload: up to $maximumBlePacketSize bytes",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Button(
+            onClick = viewModel::sendSelectedFile,
+            enabled = isTlsConnected && !isFileTransferring,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (isFileTransferring) "Transferring..." else "Transfer file")
+        }
+        Text(
+            text = "File transfer: $fileTransferStatus",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        fileTransferMetrics?.let { metrics ->
+            Text(
+                text = buildString {
+                    append("Bytes: ${metrics.bytesTransferred}\n")
+                    append("BLE packets sent: ${metrics.packetsSent}\n")
+                    append("File TX time: ${metrics.transmitMillis} ms\n")
+                    append("Total time: ${metrics.totalMillis} ms\n")
+                    append("Server verification/round trip: ${metrics.verificationMillis} ms\n")
+                    append("SHA-256: ${metrics.sha256}")
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         OutlinedTextField(
             value = inputText,
             onValueChange = { inputText = it },
@@ -195,7 +251,7 @@ fun ClientScreen(viewModel: ClientViewModel) {
         )
         Button(
             onClick = { viewModel.sendClientInputCharacteristic(inputText) },
-            enabled = isTlsConnected,
+            enabled = isTlsConnected && !isFileTransferring,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(text = "Send TLS Payload")
