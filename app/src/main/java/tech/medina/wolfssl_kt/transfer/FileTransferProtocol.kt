@@ -22,7 +22,10 @@ internal object FileTransferProtocol {
 
     // TLS 1.3 record header + inner content type + ChaCha20-Poly1305 tag.
     private const val TLS_RECORD_OVERHEAD = 5 + 1 + 16
-    private const val TARGET_FILE_CHUNK_SIZE = 250
+    // Streaming strategies do not need one TLS record to match one ATT packet. Let wolfSSL
+    // encrypt a full TLS fragment and leave BLE fragmentation to the transport layer.
+    private const val STREAM_FILE_CHUNK_SIZE = 16 * 1024
+    private const val STOP_AND_WAIT_TARGET_FILE_CHUNK_SIZE = 250
     private const val VERSION: Byte = 1
     private const val HEADER_SIZE = 10
     private val MAGIC = byteArrayOf('W'.code.toByte(), 'F'.code.toByte(), 'T'.code.toByte(), 'P'.code.toByte())
@@ -56,13 +59,13 @@ internal object FileTransferProtocol {
     }
 
     fun fileChunkSize(attPayloadSize: Int, strategy: FileTransferStrategy): Int {
-        val framingOverhead = if (strategy == FileTransferStrategy.STOP_AND_WAIT) {
-            HEADER_SIZE + Int.SIZE_BYTES
-        } else {
-            0
+        if (strategy != FileTransferStrategy.STOP_AND_WAIT) {
+            return STREAM_FILE_CHUNK_SIZE
         }
+
+        val framingOverhead = HEADER_SIZE + Int.SIZE_BYTES
         return minOf(
-            TARGET_FILE_CHUNK_SIZE,
+            STOP_AND_WAIT_TARGET_FILE_CHUNK_SIZE,
             (attPayloadSize - TLS_RECORD_OVERHEAD - framingOverhead).coerceAtLeast(1),
         )
     }

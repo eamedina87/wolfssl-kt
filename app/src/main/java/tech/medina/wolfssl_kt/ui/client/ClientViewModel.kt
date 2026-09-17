@@ -251,6 +251,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         _fileTransferMetrics.value = null
         viewModelScope.launch(Dispatchers.IO) {
             val strategy = _fileTransferStrategy.value
+            clientManager.requestHighThroughputConnection()
             val startedAt = SystemClock.elapsedRealtimeNanos()
             val initialPacketCount = clientManager.sentPacketCount()
             val initialQueuedPacketCount = clientManager.queuedBlePacketCount()
@@ -382,6 +383,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 progressInitialAcknowledgedPackets = null
                 _isFileTransferring.value = false
+                clientManager.restoreBalancedConnection()
             }
         }
     }
@@ -604,7 +606,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private fun startTlsReader() {
         tlsReadJob?.cancel()
         tlsReadJob = viewModelScope.launch(Dispatchers.IO) {
-            WolfSSLKt.read(delay = 50).collect { data ->
+            WolfSSLKt.read().collect { data ->
                 if (synchronized(fileAckLock) { pendingFileAck != null }) {
                     handleFileAckData(data)
                 } else {

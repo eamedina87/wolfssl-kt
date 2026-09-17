@@ -275,7 +275,7 @@ class ServerViewModel(application: Application) : AndroidViewModel(application) 
     private fun startTlsReader() {
         tlsReadJob?.cancel()
         tlsReadJob = viewModelScope.launch(Dispatchers.IO) {
-            WolfSSLKt.read(delay = 50).collect { data ->
+            WolfSSLKt.read().collect { data ->
                 handleIncomingPlaintext(data)
             }
         }

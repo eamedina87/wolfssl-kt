@@ -206,6 +206,35 @@ class BluetoothLeClientConnectionManager(
         }
     }
 
+    /** Requests low-latency connection parameters for the duration of a bulk transfer. */
+    @SuppressLint("MissingPermission")
+    fun requestHighThroughputConnection(): Boolean {
+        val gatt = currentGatt ?: return false
+        val priorityRequested = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            gatt.setPreferredPhy(
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+            )
+        }
+        if (!priorityRequested) {
+            Log.w(TAG, "Bluetooth stack rejected the high-priority connection request")
+        }
+        return priorityRequested
+    }
+
+    /** Restores the power-efficient default after a bulk transfer. */
+    @SuppressLint("MissingPermission")
+    fun restoreBalancedConnection(): Boolean {
+        val gatt = currentGatt ?: return false
+        val restored = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+        if (!restored) {
+            Log.w(TAG, "Bluetooth stack rejected the balanced connection request")
+        }
+        return restored
+    }
+
     private fun startOutgoingWriter() {
         outgoingWriteJob?.cancel()
         outgoingWriteJob = scope.launch {
@@ -463,6 +492,10 @@ class BluetoothLeClientConnectionManager(
                 pendingMtuAck?.complete(mtu to status)
                 pendingMtuAck = null
             }
+        }
+
+        override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            Log.i(TAG, "BLE PHY update: tx=$txPhy rx=$rxPhy status=$status")
         }
 
         override fun onDescriptorWrite(
