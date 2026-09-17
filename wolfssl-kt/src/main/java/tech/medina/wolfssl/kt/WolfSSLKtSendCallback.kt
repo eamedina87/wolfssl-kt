@@ -6,8 +6,9 @@ import com.wolfssl.WolfSSLIOSendCallback
 import com.wolfssl.WolfSSLSession
 import kotlinx.coroutines.channels.Channel
 
-class WolfSSLKtSendCallback(
-    private val outgoingEncryptedDataChannel: Channel<ByteArray>
+class WolfSSLKtSendCallback @JvmOverloads constructor(
+    private val outgoingEncryptedDataChannel: Channel<ByteArray>,
+    private val onEncryptedDataQueued: ((Int) -> Unit)? = null,
 ) : WolfSSLIOSendCallback {
     //SendCallback is where we receive the data encrypted by WolfSSL that should be sent to the peer.
     //We send the data to the peer using the channel provided in the constructor.
@@ -19,6 +20,7 @@ class WolfSSLKtSendCallback(
     ): Int {
         val result = outgoingEncryptedDataChannel.trySend(buffer.copyOf(size))
         return if (result.isSuccess) {
+            onEncryptedDataQueued?.invoke(size)
             Log.d("WolfSSL-SendCallback", "TLS send encrypted ($size): ${buffer.copyOf(size).toLogString()}")
             size
         } else {

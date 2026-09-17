@@ -20,6 +20,7 @@ class WolfSSLKtReceiveCallback internal constructor(
 ) : WolfSSLIORecvCallback {
     private val inboundBuffer = ArrayDeque<Byte>()
     private val inboundLock = Any()
+    private val dataAvailable = Channel<Unit>(Channel.CONFLATED)
 
     private val receiveJob: Job = appScope.launch {
         incomingEncryptedDataChannel.receiveAsFlow()
@@ -28,7 +29,14 @@ class WolfSSLKtReceiveCallback internal constructor(
                 synchronized(inboundLock) {
                     chunk.forEach { inboundBuffer.addLast(it) }
                 }
+                dataAvailable.trySend(Unit)
             }
+    }
+
+    /** Suspends until encrypted input is available without adding a fixed polling delay. */
+    suspend fun awaitData(): Boolean {
+        if (synchronized(inboundLock) { inboundBuffer.isNotEmpty() }) return true
+        return dataAvailable.receiveCatching().isSuccess
     }
 
     override fun receiveCallback(
@@ -54,5 +62,6 @@ class WolfSSLKtReceiveCallback internal constructor(
 
     fun cancel() {
         receiveJob.cancel()
+        dataAvailable.close()
     }
 }

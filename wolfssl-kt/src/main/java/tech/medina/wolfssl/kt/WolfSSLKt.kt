@@ -7,7 +7,6 @@ import com.wolfssl.WolfSSLException
 import com.wolfssl.WolfSSLLoggingCallback
 import com.wolfssl.WolfSSLSession
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -15,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 
@@ -211,34 +211,46 @@ object WolfSSLKt {
         }
     }
 
-    fun read(delay: Long) : Flow<ByteArray> = flow {
-        val buffer = ByteArray(1024)
+    fun read() : Flow<ByteArray> = flow {
+        val buffer = ByteArray(TLS_READ_BUFFER_SIZE)
+        var waitForEncryptedData = false
         while (appScope.isActive) {
-            delay(delay)
-            if (currentSession == null) {
+            if (waitForEncryptedData) {
+                val callback = receiveCallback ?: return@flow
+                if (!callback.awaitData()) return@flow
+                waitForEncryptedData = false
+            }
+
+            val session = currentSession ?: return@flow
+            if (session.shutdown == SSL_SENT_SHUTDOWN || session.shutdown == SSL_RECEIVED_SHUTDOWN) {
                 return@flow
             }
-            if (currentSession!!.shutdown == SSL_SENT_SHUTDOWN || currentSession!!.shutdown == SSL_RECEIVED_SHUTDOWN) {
-                return@flow
-            }
-            if (currentSession!!.gotCloseNotify()) {
+            if (session.gotCloseNotify()) {
                 release()
                 return@flow
             }
-            val readBytes = currentSession!!.read(buffer, buffer.size)
+            val readBytes = session.read(buffer, buffer.size)
             if (readBytes > 0) {
                 val decrypted = buffer.copyOf(readBytes)
                 Log.d(TAG, "TLS recv decrypted ($readBytes): ${decrypted.toLogString()}")
                 emit(decrypted)
             } else {
-                val error = currentSession!!.getError(readBytes)
-                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
-                    Log.e("WolfSSL", "Failed to read data. WolfSSL error: $error")
+                when (val error = session.getError(readBytes)) {
+                    SSL_ERROR_WANT_READ -> waitForEncryptedData = true
+                    SSL_ERROR_WANT_WRITE -> yield()
+                    else -> {
+                        Log.e("WolfSSL", "Failed to read data. WolfSSL error: $error")
+                        waitForEncryptedData = true
+                    }
                 }
             }
         }
-
     }
+
+    /** Kept for source compatibility. Reads are now event-driven, so [delay] is ignored. */
+    @Deprecated("Reads are event-driven; use read()")
+    @Suppress("UNUSED_PARAMETER")
+    fun read(delay: Long): Flow<ByteArray> = read()
 
 
     //TODO store session ticket
@@ -284,5 +296,7 @@ object WolfSSLKt {
         CLIENT(TLSv1_3_ClientMethod()),
         SERVER(TLSv1_3_ServerMethod())
     }
+
+    private const val TLS_READ_BUFFER_SIZE = 16 * 1024
 
 }
